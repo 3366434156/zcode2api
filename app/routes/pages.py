@@ -49,6 +49,11 @@ async def admin_monitoring():
     return _html("monitoring.html")
 
 
+@router.get("/admin/agents", include_in_schema=False)
+async def admin_agents():
+    return _html("agents.html")
+
+
 @router.get("/admin/settings", include_in_schema=False)
 async def admin_settings():
     return _html("settings.html")

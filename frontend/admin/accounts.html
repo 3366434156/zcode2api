@@ -232,13 +232,22 @@ function allEntitlements(a){
   return out;
 }
 
+// 已到期窗口：上游 billing/balance 在日切（本地 09:00）后仍会列出上一窗口，
+// remaining 还是旧数字 —— 额度已经不可用，展示与统计都不再考虑
+function windowExpired(w,now){
+  const exp=Number(w&&w.expires_at)||0;
+  return exp>0&&exp<=now;
+}
+
 // 赠送授权是否已被 balance 窗口体现（上游 2026-09-06 起把 one_time 池并入 balance；
 // 同模型窗口 total >= 授权量即视为已含，避免赠送重复渲染/重复计数）
 function bonusCoveredByBalance(a, e){
   const grant=Number(e.grant_units)||0;
   if(!grant)return false;
+  const now=Date.now()/1000;
   return Object.entries(a.quota||{}).some(([k,w])=>{
     if(k!==e.show_name)return false;
+    if(windowExpired(w,now))return false;   // 过期窗口不算「已体现」
     return Number(w&&w.total)||0>=grant;
   });
 }
@@ -252,7 +261,7 @@ function renderStats(s){
   const now=Date.now()/1000;
   let totalRem=0;
   allAccounts.forEach(a=>{
-    Object.values(a.quota||{}).forEach(w=>{totalRem+=Number(w.remaining)||0;});
+    Object.values(a.quota||{}).forEach(w=>{if(windowExpired(w,now))return;totalRem+=Number(w.remaining)||0;});
     allEntitlements(a).forEach(e=>{
       const eff=Number(e.effective_at)||0;
       let ends=Number(e.ends_at||e.expires_at)||e._planEnds||0;
@@ -378,7 +387,10 @@ function rowHtml(a){
 
 function quotaCell(a){
   const q=a.quota||{};
-  const keys=Object.keys(q);
+  const now=Date.now()/1000;
+  // 已到期窗口不再显示（「已经消失的额度」）：上游 balance 日切后仍会列出来，
+  // 但剩余量已不可用，留在表里只会误导成还有额度
+  const keys=Object.keys(q).filter(k=>!windowExpired(q[k],now));
   let rows=keys.map(k=>{
     const w=q[k]||{};const rem=Number(w.remaining)||0,tot=Number(w.total)||0;
     const pct=tot>0?Math.max(0,Math.min(100,Math.round(rem/tot*100))):0;
@@ -393,7 +405,6 @@ function quotaCell(a){
   // 活动额度（plan.entitlements）：
   // ① one_time 已生效 —— billing/balance 不体现这类一次性赠送，单独渲染「活动赠送」行
   // ② 待生效（effective_at 在未来）—— 斜纹流动条，过点自动转正
-  const now=Date.now()/1000;
   const ents=allEntitlements(a);
   ents.filter(e=>{
     const eff=Number(e.effective_at)||0, ends=Number(e.ends_at||e.expires_at)||e._planEnds||0;

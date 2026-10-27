@@ -18,6 +18,17 @@
     </div>
   </div>
 
+  <div class="settings-card" id="deploy-card">
+    <div class="section-title" style="margin-bottom:8px">客户端一键部署</div>
+    <div class="hint" style="margin-bottom:10px">把本网关一键写进 AI 客户端（magpie 等）的配置：只加一条 provider，写前备份、可一键还原；
+      多台电脑用 magpie 的 GitHub 加密同步共享同一套配置。</div>
+    <div class="hint" id="deploy-status">加载中…</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+      <button class="btn btn-primary" id="deploy-magpie" onclick="deployMagpie()">一键接入 magpie</button>
+      <a class="btn btn-ghost" href="/admin/agents" style="text-decoration:none;display:inline-flex;align-items:center">打开「客户端接入」页</a>
+    </div>
+  </div>
+
   <div class="settings-card">
     <div class="section-title" style="margin-bottom:16px">鉴权</div>
     <div class="settings-row">
@@ -57,7 +68,9 @@
       · 在「账号池」粘贴 Coding Plan JWT 或 API Key 即可加入轮询。<br>
       · 请求按 round-robin 分发；某账号额度用完会自动切到下一个账号。<br>
       · 账号额度、状态在「账号池」页实时刷新展示。<br>
-      · 对话端点：<code id="endpoint">/v1/messages</code>（兼容 Anthropic Messages 协议）。
+      · 对话端点：<code id="endpoint">/v1/messages</code>（兼容 Anthropic Messages 协议）。<br>
+      · 局域网访问：同一网段用 <code id="lan-url">http://&lt;本机IP&gt;:3000/admin</code> 打开本后台
+      （首次需放行防火墙：仓库里双击 <code>allow-firewall.bat</code>）。
     </div>
   </div>
 </main>
@@ -71,8 +84,43 @@
   const key=await adminKey.get();
   if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';
   document.getElementById('endpoint').textContent=location.origin+'/v1/messages';
+  const lan=document.getElementById('lan-url');
+  if(lan)lan.textContent=location.origin+'/admin';
   load();
+  renderDeploy();
 })();
+
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+/* 客户端一键部署：状态摘要 + 直接接入 magpie（详细操作在「客户端接入」页） */
+async function renderDeploy(){
+  const box=document.getElementById('deploy-status');
+  if(!box)return;
+  try{
+    const d=await api('GET','/agents');
+    const c=(d.clients||[]).find(x=>x.id==='magpie')||{};
+    const s=(d.remote&&d.remote.magpie&&d.remote.magpie.sync)||{};
+    const bits=[
+      c.installed?'magpie 已安装':'magpie 未检测到',
+      c.configured?`已接入（指向 ${c.applied?.base_url||'—'}）`:'未接入',
+      c.running?'正在运行':'未运行',
+      s.enabled?`GitHub 同步已开${s.last?' · 上次 '+String(s.last).replace('T',' ').slice(0,16):''}`:'GitHub 同步未开',
+    ];
+    box.innerHTML=bits.map(esc).join(' · ');
+    const btn=document.getElementById('deploy-magpie');
+    if(btn)btn.textContent=c.configured?'重新接入 magpie':'一键接入 magpie';
+  }catch(e){box.textContent='读取状态失败: '+e.message;}
+}
+
+async function deployMagpie(){
+  if(!confirm('把 magpie 的配置指向本网关？\n\n写前自动备份，可随时在「客户端接入」页一键还原。'))return;
+  try{
+    const r=await api('POST','/agents/apply',{client:'magpie'});
+    const acts=(r.records||[]).map(x=>x.action).join(', ');
+    showToast('已接入 magpie（'+acts+'）','success');
+    renderDeploy();
+  }catch(e){showToast('接入失败: '+e.message,'error');}
+}
 
 async function load(){
   try{

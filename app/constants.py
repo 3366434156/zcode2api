@@ -41,23 +41,27 @@ USAGE_PATH = "/usage"
 OAUTH_CLI_INIT_PATH = "/api/v1/oauth/cli/init"
 OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 
-# ── 客户端版本（单一真相源：官方客户端 3.14.4，2026-10-02 跟进）────────────────
+# ── 客户端版本（单一真相源：官方客户端 3.16.3，2026-10-26 跟进）────────────────
 # 客户端 claim 头实测缺版本/平台头 → 上游 3007；client/configs 带 platform 参数 → 3001
-# 出处：本机官方 ZCode.exe（注册表 DisplayVersion=3.14.4，2026-10-02 实测；
-# 前值 3.14.3 为 ProductVersion 3.14.3.7762 / app.asar rS="3.14.3"，构建 2026-09-22）。
+# 出处：本机官方 ZCode.exe（注册表 DisplayName/DisplayVersion=3.16.3，2026-10-26
+# 实测；前值 3.14.4，2026-10-02）。
 # zcode-switch 在 Windows 上经 `zcode_app_version()` 读注册表本机真实版去打
 # billing（官方升版即自动跟进）；hub 跑 Linux 无注册表，钉此常量为唯一真相源。
-# ⚠️ 上游疑似按客户端版本门槛投放活动套餐：钉旧版（3.11.2）时 preview 恒空，
-# 跟进官方现行版后恢复——发现 preview 为空时优先核对此常量是否落后于官方。
-CLIENT_APP_VERSION = "3.14.4"
+# ⚠️ 上游按客户端版本门槛投放活动套餐：钉旧版（3.11.2）时 preview 恒空；
+# 2026-10-26 复现第二次——钉 3.14.4 时 preview 恒空（code:0 / plans:[]），
+# 同一账号同一时刻换 app_version=3.16.3 立刻返回 zcode-v3-start-plan-nt-1026。
+# 发现 preview 为空时优先核对此常量是否落后于官方。
+CLIENT_APP_VERSION = "3.16.3"
 CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
 CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
 
 # ── billing 族版本 / 激活上报（zcode-switch v1.5.4 实证，2026-09-06 移植）─────
 # billing 族（preview/claim/balance/current/usage/configs/event）用官方桌面端
-# 现行版（对齐 zcode-switch Windows 路径读到的本机真实版；hub 钉常量，见上）
-BILLING_APP_VERSION = "3.14.4"
+# 现行版。2026-10-26 起与 CLIENT_APP_VERSION 同源：两者都只是「客户端版本」，
+# 分开维护只会漂移（曾出现 messages 3.16.3 / billing 3.14.4，活动套餐因此
+# 对 billing 端不可见），故直接引用同一常量，升版改一处即可。
+BILLING_APP_VERSION = CLIENT_APP_VERSION
 BILLING_TITLE = "Z Code@electron"        # zcode-switch billing 头实证形态
 BILLING_RELEASE_CHANNEL = "stable"
 # 官方客户端每日活跃事件：POST /api/v1/event/report（不在 zcode-plan 下、无
@@ -114,6 +118,17 @@ IDENTITY_CLIENT_TIMEZONE = "Asia/Shanghai"
 IDENTITY_OS_CATEGORY = "macos"
 # X-Os-Version：os.release() 语义；darwin 25.x 对应 macOS 15。固定伪装值。
 IDENTITY_OS_VERSION = "25.5.0"
+
+# ── CLI 形态身份头（2026-10-26 实证：zcode.z.ai 只认官方 CLI 请求形状）─────────
+# 背景：桌面端（electron）仿真形态自 3.16.x 起对 messages 一律 405/3012；抓包对照
+# 后确认上游校验的是「CLI 形态」：X-Title=Z Code@cli、release-channel=production、
+# UA 带 ai-sdk 后缀、Bearer 与 x-api-key 双带、并带 x-query-id/x-session-id/
+# x-zcode-query-source；同时**不发送** X-Device-Mid。参照实现：orangeTZ07/zcode-plan-bridge。
+CLI_TITLE = "Z Code@cli"
+CLI_RELEASE_CHANNEL = "production"
+CLI_QUERY_SOURCE = "main_turn"
+# 官方 CLI UA 后缀（ai-sdk provider 指纹 + 运行时 node 主版本）
+CLI_UA_SUFFIX = "ai-sdk/provider-utils/4.0.27 runtime/node.js/24"
 
 # ── 上游被拒信号 → 账号动作（gateway / quota 判定共用）────────────────────────
 EXHAUST_HTTP_STATUSES = (402,)

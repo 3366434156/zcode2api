@@ -210,11 +210,28 @@ class TestBuildRequest:
         assert url == "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages"
         assert headers["Authorization"] == "Bearer a.b.c"
         assert headers["anthropic-version"] == "2023-06-01"
-        # JWT 通道带全量身份头 + 追踪头；桌面端账号走 electron/stable
+        # 默认 CLI 形态（2026-10-26 实测可用）：@cli / production / Bearer+x-api-key 双带，
+        # 不发 X-Device-Mid；桌面端（@electron/stable）形态由 MESSAGES_STYLE 切回
+        assert headers["X-Title"] == "Z Code@cli"
+        assert headers["X-Release-Channel"] == "production"
+        assert headers["x-api-key"] == "a.b.c"
+        assert "X-Device-Mid" not in headers
+        lower = {k.lower() for k in headers}
+        for name in ("x-request-id", "x-zcode-trace-id", "x-query-id", "x-session-id",
+                     "x-zcode-query-source"):
+            assert name in lower, name
+
+    def test_jwt_desktop_style_keeps_legacy_headers(self, monkeypatch):
+        """ZCODE_MESSAGES_STYLE=desktop 时回落到旧仿真头（回归开关）。"""
+        from app import settings
+        from app.agent import build_request
+        monkeypatch.setattr(settings, "MESSAGES_STYLE", "desktop")
+        acc = Account.create("zai", "t", "a.b.c")
+        _, headers, _payload = build_request(acc, {}, None)
         assert headers["X-Title"] == "Z Code@electron"
         assert headers["X-Release-Channel"] == "stable"
         assert "X-Device-Mid" in headers
-        assert "x-request-id" in headers and "x-zcode-trace-id" in headers
+        assert "x-api-key" not in {h.lower() for h in headers}
 
     def test_apikey_routes_to_fallback(self):
         from app.agent import build_request
@@ -252,9 +269,9 @@ class TestBuildRequest:
             "authorization": "Bearer client", "x-api-key": "leak", "user-agent": "UA/1",
             "x-zcode-foo": "strip", "x-custom": "keep",
         })
-        # 客户端的鉴权/身份头被丢弃，authorization 保留的是账号自身凭证
+        # 客户端的鉴权/身份头被丢弃；authorization / x-api-key 都是账号自身凭证
         assert headers["Authorization"] == "Bearer a.b.c"
-        assert "x-api-key" not in {h.lower() for h in headers}
+        assert headers["x-api-key"] == "a.b.c"
         assert headers.get("x-zcode-foo") is None
         assert headers["User-Agent"] != "UA/1"
         assert headers.get("x-custom") == "keep"
@@ -326,8 +343,12 @@ class TestGatewayHTTP:
         })
         assert res.status_code == 200
         assert res.json()["content"][0]["text"] == "Hello from mock upstream"
-        # 上游收到归一化后的模型名与鉴权头
-        method, path, headers, _ = upstream.state.calls[-1]
+        # 上游收到归一化后的模型名与鉴权头。
+        # mock.state.calls 是会话级共享记录：成功响应后网关会在后台拉 billing
+        # （GET，随时可能追加），所以按路径回溯，不能直接取 calls[-1]
+        method, path, headers, _ = next(
+            c for c in reversed(upstream.state.calls) if c[1].endswith("/v1/messages")
+        )
         assert path == "/api/v1/zcode-plan/anthropic/v1/messages"
 
     async def test_no_account_503(self, gateway_client):

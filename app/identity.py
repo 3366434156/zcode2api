@@ -103,6 +103,58 @@ def build_identity_headers(account=None) -> dict[str, str]:
     return headers
 
 
+def build_cli_identity_headers(account=None) -> dict[str, str]:
+    """CLI 形态身份头（3.16.3 实测可用；messages 通道默认走这套）。
+
+    与桌面端仿真的差异（实测导出，见 constants.CLI_*）：
+      - X-Title = "Z Code@cli"（不是 @electron）、release-channel = production；
+      - UA = "ZCode/{ver} {ai-sdk 后缀}"；
+      - X-Os-Category 原样上报 CLI 的 process.platform（win32 / darwin / linux）；
+      - 追加 x-query-id / x-session-id / x-zcode-query-source；
+      - **不发送** X-Device-Mid（官方 CLI 不带，实测带上亦无益）。
+    平台/语言/时区/OS 版本仍取账号指纹，保证多账号互不关联。
+    """
+    if account is not None:
+        from .fingerprint import profile_for
+
+        profile = profile_for(account)
+        plat, arch = profile.platform, profile.arch
+        os_version = profile.os_version
+        language, timezone = profile.language, profile.timezone
+    else:
+        parts = constants.CLIENT_PLATFORM.split("-")
+        plat = parts[0] if parts else "darwin"
+        arch = parts[1] if len(parts) > 1 else "arm64"
+        os_version = constants.IDENTITY_OS_VERSION
+        language = constants.IDENTITY_CLIENT_LANGUAGE
+        timezone = constants.IDENTITY_CLIENT_TIMEZONE
+
+    app_version = constants.CLIENT_APP_VERSION
+    headers: dict[str, str] = {
+        "HTTP-Referer": constants.ZCODE_ORIGIN,
+        "User-Agent": f"ZCode/{app_version} {constants.CLI_UA_SUFFIX}",
+        "X-ZCode-App-Version": app_version,
+        "X-ZCode-Agent": constants.X_ZCODE_AGENT,
+        "X-Title": constants.CLI_TITLE,
+        "X-Platform": f"{plat}-{arch}",
+        "X-Release-Channel": constants.CLI_RELEASE_CHANNEL,
+        "X-Client-Language": language,
+        "X-Client-Timezone": timezone,
+        "X-Os-Category": plat,
+        "X-Os-Version": os_version,
+        "X-Query-Id": str(uuid.uuid4()),
+        "X-Session-Id": str(uuid.uuid4()),
+        "X-Zcode-Query-Source": constants.CLI_QUERY_SOURCE,
+        "X-Request-Id": str(uuid.uuid4()),
+        "X-Zcode-Session-Type": "main",
+        "X-Zcode-Trace-Id": str(uuid.uuid4()),
+        "Accept": "*/*",
+        "Accept-Language": "*",
+        "Sec-Fetch-Mode": "cors",
+    }
+    return headers
+
+
 def build_trace_headers(plan: str = "start-plan") -> dict[str, str]:
     """追踪头：每请求全新 UUID（对齐 zapi upstream.ts buildTraceHeaders）。
 

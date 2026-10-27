@@ -270,8 +270,15 @@ class Store:
             return True
 
     # ── 轮询选择 ─────────────────────────────────────────────────────────────
-    def select(self, provider: str, skip_ids: set[str] | None = None) -> Account | None:
-        """按 round-robin 选择下一个可用账号。用完 / 失效的自动跳过。"""
+    def select(self, provider: str, skip_ids: set[str] | None = None,
+               prefer: str | None = None) -> Account | None:
+        """选择下一个可用账号：粘性命中优先，否则 round-robin。
+
+        prefer 是会话粘性记住的账号 id（见 app/affinity.py）：它仍在可用池里
+        就直接用它，且**不推进轮询指针**——粘性命中不是一次"轮到谁"，让指针
+        原地不动，别把轮询节奏带偏。它不在池里（冷却 / 额度用完 / 已删除 /
+        并发满被 skip）才照常轮询。
+        """
         skip_ids = skip_ids or set()
         now = time.time()
         with self._lock:
@@ -281,6 +288,10 @@ class Store:
             ]
             if not pool:
                 return None
+            if prefer:
+                for a in pool:
+                    if a.id == prefer:
+                        return a
             idx = self._rotation.get(provider, 0) % len(pool)
             account = pool[idx]
             self._rotation[provider] = (idx + 1) % len(pool)

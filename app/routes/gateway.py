@@ -15,12 +15,17 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .. import constants, logs, reqlog, settings
+from .. import affinity, constants, logs, reqlog, settings
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
 from ..models import Account, Status
-from ..openai_compat import StreamConverter, anthropic_to_openai, openai_to_anthropic
+from ..openai_compat import (
+    StreamConverter,
+    UsageSniffer,
+    anthropic_to_openai,
+    openai_to_anthropic,
+)
 from ..quota import fetch_quota
 from ..store import store
 
@@ -196,6 +201,7 @@ async def messages(request: Request):
 
     incoming_headers = dict(request.headers)
     provider = _detect_provider(body, request.headers)
+    requested_model = str(body.get("model") or "")   # 归一化前客户端点的模型
     body = _normalize_body(body)
     # 验证码页面由本服务托管，端口取实际请求端口（兼容任意启动端口）
     port = request.url.port or settings.PORT
@@ -203,14 +209,18 @@ async def messages(request: Request):
     req_id = secrets.token_hex(8)
     logs.req(req_id, str(body.get("model") or "-"), bool(body.get("stream")), _last_user_text(body))
     reqlog.begin(req_id, "messages", str(body.get("model") or "-"),
-                 bool(body.get("stream")), _last_user_text(body))
+                 bool(body.get("stream")), _last_user_text(body),
+                 provider=provider, requested_model=requested_model,
+                 client=request.headers.get("user-agent", ""))
 
     try:
-        result = await _dispatch(req_id, body, incoming_headers, port, provider)
+        result = await _dispatch(req_id, body, incoming_headers, port, provider,
+                                 affinity.key_of(body))
     except asyncio.CancelledError:
         # 客户端在调度期间断开（429 重试/验证码等待可达数分钟）——CancelError
         # 是 BaseException，不兜底会让监控条目永久滞留「进行中」
-        reqlog.finish_error(req_id, "客户端断开", status=499)
+        reqlog.finish_error(req_id, "客户端断开", status=499,
+                            outcome=reqlog.OUTCOME_CLIENT_ABORTED)
         raise
     except Exception as err:  # noqa: BLE001 - 调度层意外异常也要收口监控条目
         reqlog.finish_error(req_id, f"网关内部错误: {err}", status=500)
@@ -249,12 +259,16 @@ async def chat_completions(request: Request):
     req_id = secrets.token_hex(8)
     logs.req(req_id, str(body.get("model") or "-"), bool(payload.get("stream")), _last_user_text(body))
     reqlog.begin(req_id, "chat", str(body.get("model") or "-"),
-                 bool(payload.get("stream")), _last_user_text(body))
+                 bool(payload.get("stream")), _last_user_text(body),
+                 provider=provider, requested_model=str(payload.get("model") or ""),
+                 client=request.headers.get("user-agent", ""))
 
     try:
-        result = await _dispatch(req_id, body, incoming_headers, port, provider)
+        result = await _dispatch(req_id, body, incoming_headers, port, provider,
+                                 affinity.key_of(body))
     except asyncio.CancelledError:
-        reqlog.finish_error(req_id, "客户端断开", status=499)
+        reqlog.finish_error(req_id, "客户端断开", status=499,
+                            outcome=reqlog.OUTCOME_CLIENT_ABORTED)
         raise
     except Exception as err:  # noqa: BLE001 - 调度层意外异常也要收口监控条目
         reqlog.finish_error(req_id, f"网关内部错误: {err}", status=500)
@@ -274,25 +288,40 @@ async def chat_completions(request: Request):
             raise
 
     try:
-        raw = await result.resp.aread()
+        raw = await result.read()
         logs.req_ok(req_id)
     except asyncio.CancelledError:
-        reqlog.finish_error(req_id, "客户端断开", status=499, t_first=result.t_first)
+        reqlog.finish_error(req_id, "客户端断开", status=499, t_first=result.t_first,
+                            outcome=reqlog.OUTCOME_CLIENT_ABORTED)
         raise
     except Exception as err:  # noqa: BLE001
         logs.req_err(req_id, f"读取上游响应失败: {err}")
-        reqlog.finish_error(req_id, f"读取上游响应失败: {err}", status=502)
+        reqlog.finish_error(req_id, f"读取上游响应失败: {err}", status=502,
+                            outcome=reqlog.OUTCOME_UPSTREAM_ABORTED)
         return JSONResponse({"error": {"message": f"读取上游响应失败: {err}", "type": "upstream_error"}}, status_code=502)
     finally:
         await result.close()
     data = _safe_json(raw.decode("utf-8", "ignore"))
     if not isinstance(data, dict) or data.get("type") != "message":
-        reqlog.finish_error(req_id, "上游响应格式异常", status=502, t_first=result.t_first)
+        reqlog.finish_error(req_id, "上游响应格式异常", status=502, t_first=result.t_first,
+                            outcome=reqlog.OUTCOME_UPSTREAM_ABORTED)
         return JSONResponse({"error": {"message": "上游响应格式异常", "type": "upstream_error"}}, status_code=502)
     usage = data.get("usage") or {}
-    reqlog.finish_ok(req_id, t_first=result.t_first, status=result.resp.status_code,
-                     input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"))
+    reqlog.mark_first(req_id)
+    reqlog.mark_last(req_id)
+    reqlog.note_usage(req_id, **_usage_kwargs(usage))
+    reqlog.finish_ok(req_id, t_first=result.t_first, status=result.resp.status_code)
     return JSONResponse(anthropic_to_openai(data, model))
+
+
+def _usage_kwargs(usage: dict) -> dict:
+    """上游 usage 块 → reqlog.note_usage 的关键字参数（缺字段就不传）。"""
+    return {
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "cached_tokens": usage.get("cache_read_input_tokens", usage.get("cached_tokens")),
+        "credit": usage.get("credit") if isinstance(usage.get("credit"), (int, float)) else None,
+    }
 
 
 def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> StreamingResponse:
@@ -302,7 +331,10 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
     async def _iter():
         try:
             yield conv.start()
-            async for line in up.resp.aiter_lines():
+            async for line in _paced(up.lines()):
+                if line is _KEEPALIVE:
+                    yield line  # 上游静默期的心跳，原样透给客户端
+                    continue
                 if not line.startswith("data:"):
                     continue
                 data_str = line[5:].strip()
@@ -310,19 +342,29 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
                     continue
                 evt = _safe_json(data_str)
                 if isinstance(evt, dict):
-                    for out in conv.feed(evt):
-                        yield out
+                    out = conv.feed(evt)
+                    if out:
+                        reqlog.mark_first(req_id)
+                        reqlog.mark_last(req_id)
+                    for chunk in out:
+                        yield chunk
             yield conv.done()
             logs.req_ok(req_id)
-            reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
-                             input_tokens=conv.usage.get("prompt_tokens"),
-                             output_tokens=conv.usage.get("completion_tokens"))
+            reqlog.note_usage(req_id, input_tokens=conv.usage.get("prompt_tokens"),
+                              output_tokens=conv.usage.get("completion_tokens"),
+                              cached_tokens=conv.usage.get("cached_tokens"))
+            reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code)
         except asyncio.CancelledError:
-            reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
+            reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first,
+                                outcome=reqlog.OUTCOME_CLIENT_ABORTED)
             raise
         except Exception as err:  # noqa: BLE001
             logs.req_err(req_id, f"流传输中断: {err}")
-            reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
+            reqlog.note_usage(req_id, input_tokens=conv.usage.get("prompt_tokens"),
+                              output_tokens=conv.usage.get("completion_tokens"),
+                              cached_tokens=conv.usage.get("cached_tokens"))
+            reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first,
+                                outcome=reqlog.OUTCOME_UPSTREAM_ABORTED)
         finally:
             await up.close()
 
@@ -330,20 +372,24 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
                              headers={"Cache-Control": "no-cache"})
 
 
-async def _dispatch(req_id, body, incoming_headers, port, provider):
+async def _dispatch(req_id, body, incoming_headers, port, provider, conv_key: str = ""):
     """多账号轮询调度：_Upstream（成功）或 JSONResponse（错误）。
 
-    单账号并发限制：选号后若该账号在飞请求已达上限（store.account_concurrency，
-    0 = 不限），跳过换下一个账号——不排队（流式请求可占槽位数分钟，排队会
-    放大延迟甚至吊死客户端）。满号跳过不计入 MAX_ACCOUNT_ATTEMPTS（只计真正
-    进入 _try_account 的次数）。全满/无号 → 503。
+    选号顺序：会话粘性记住的账号优先（同一段对话回到同一账号，上游前缀缓存
+    才能继续命中），否则 round-robin。单账号并发限制：选号后若该账号在飞请求
+    已达上限（store.account_concurrency，0 = 不限），跳过换下一个账号——不排队
+    （流式请求可占槽位数分钟，排队会放大延迟甚至吊死客户端）。满号跳过不计入
+    MAX_ACCOUNT_ATTEMPTS（只计真正进入 _try_account 的次数）。全满/无号 → 503。
     """
     tried: set[str] = set()
     limit = _limit()
     attempts = 0
+    prefer = affinity.prefer(provider, conv_key)
+    # 换号原因的出口：最后一个账号为什么不可用（模型额度用尽等），503 时如实回给客户端
+    reason: list[str] = [""]
 
     while attempts < MAX_ACCOUNT_ATTEMPTS:
-        account = store.select(provider, skip_ids=tried)
+        account = store.select(provider, skip_ids=tried, prefer=prefer)
         if account is None:
             break
         tried.add(account.id)
@@ -360,6 +406,7 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
         try:
             result = await _try_account(
                 req_id, account, body, incoming_headers, port, needs_captcha, slot_box,
+                reason,
             )
         except BaseException:
             if slot_box[0] is not None:
@@ -372,6 +419,7 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
                 slot_box[0] = None
             continue
         if isinstance(result, _Upstream):
+            affinity.remember(provider, conv_key, account.id)
             held = slot_box[0]
             slot_box[0] = None
             if held is not None:
@@ -382,10 +430,12 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
             slot_box[0] = None
         return result
 
-    logs.req_err(req_id, "无可用账号 / 额度均已耗尽 / 并发已满")
-    reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽 / 并发已满", status=503)
+    detail = reason[0] or "无可用账号 / 额度均已耗尽 / 并发已满"
+    logs.req_err(req_id, detail)
+    reqlog.finish_error(req_id, detail, status=503)
+    message = reason[0] or "所有账号均不可用、额度已用完或并发已满，请在后台检查账号状态"
     return JSONResponse(
-        {"error": {"message": "所有账号均不可用、额度已用完或并发已满，请在后台检查账号状态", "type": "no_available_account"}},
+        {"error": {"message": message, "type": "no_available_account"}},
         status_code=503,
     )
 
@@ -449,14 +499,79 @@ def _limit() -> int:
     return store.account_concurrency()
 
 
-class _Upstream:
-    """已建立的上游成功流：由调用方消费并负责关闭。"""
+# SSE 注释帧：所有 SSE 客户端都会跳过，它只表示「连接还活着」。
+# 结尾不留空行——有些客户端（openai-go v2）把空行当事件解析，会报 JSON 错
+# （magpie 的 sseWriter.comment 同样只写 ": keepalive\n"）。
+_KEEPALIVE = ": keep-alive\n"
 
-    __slots__ = ("resp", "cm", "client", "t_first", "account_name", "mode", "on_close", "_closed")
+
+async def _paced(source, idle: float | None = None, stall: float | None = None):
+    """把上游分块流转发给客户端，同时做两件事。
+
+    1. 客户端空闲满 idle 秒就补一条 SSE 注释帧。模型思考阶段上游可能只有
+       thinking 事件（甚至什么都没有），没有注释帧，客户端与中间代理都无从
+       判断连接是否还活着，界面只能显示「未响应」。
+    2. 上游彻底静默满 stall 秒即判定连接已死并抛错。httpx 的 read 超时是
+       None（长回复不能设总时长上限），缺了这层看门狗，半死的 TCP 连接会把
+       请求永久挂住——客户端也就永久「未响应」。
+
+    上游读取放在独立 task 里当生产者，消费侧只等队列：空闲超时因此不会取消
+    上游的读操作（取消读会破坏 httpx 的流状态）。
+    """
+    idle = idle if idle is not None else settings.SSE_KEEPALIVE_IDLE
+    stall = stall if stall is not None else settings.UPSTREAM_STALL_SECONDS
+    queue: asyncio.Queue = asyncio.Queue()
+    eof = object()
+
+    async def pump() -> None:
+        try:
+            async for item in source:
+                await queue.put(item)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001 - 读上游失败交给消费侧统一收口
+            await queue.put(err)
+        finally:
+            await queue.put(eof)
+
+    task = asyncio.create_task(pump())
+    silent = 0.0
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), idle)
+            except TimeoutError as err:
+                silent += idle
+                if silent >= stall:
+                    raise TimeoutError(
+                        f"上游 {stall:.0f}s 没有任何数据，判定连接已死"
+                    ) from err
+                yield _KEEPALIVE
+                continue
+            silent = 0.0
+            if item is eof:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        task.cancel()
+
+
+class _Upstream:
+    """已建立的上游成功流：由调用方消费并负责关闭。
+
+    `preloaded` 是调度阶段就已经读进内存的响应体（非 SSE 的响应）：上游对业务
+    错误也回 200（body 形如 `{"code":1005,"msg":"exceed quota limit"}`），要判断
+    是错误还是整体回复，只能先读一次——读完就把内容挂在这里，消费方别再读流。
+    """
+
+    __slots__ = ("resp", "cm", "client", "t_first", "account_name", "mode", "on_close",
+                 "preloaded", "_closed")
 
     def __init__(self, resp: httpx.Response, cm, client: httpx.AsyncClient,
                  t_first: float | None = None, account_name: str = "", mode: str = "",
-                 on_close=None) -> None:
+                 on_close=None, preloaded: bytes | None = None) -> None:
         self.resp = resp
         self.cm = cm
         self.client = client
@@ -464,7 +579,32 @@ class _Upstream:
         self.account_name = account_name
         self.mode = mode
         self.on_close = on_close
+        self.preloaded = preloaded
         self._closed = False
+
+    async def read(self) -> bytes:
+        """整体读取响应体（调度阶段已读过的直接返回，避免重复消费）。"""
+        if self.preloaded is not None:
+            return self.preloaded
+        return await self.resp.aread()
+
+    async def chunks(self):
+        """响应体的字节流（透传路径用）。"""
+        if self.preloaded is not None:
+            if self.preloaded:
+                yield self.preloaded
+            return
+        async for chunk in self.resp.aiter_bytes():
+            yield chunk
+
+    async def lines(self):
+        """响应体的文本行流（OpenAI 转换路径用）。"""
+        if self.preloaded is not None:
+            for line in self.preloaded.decode("utf-8", "ignore").splitlines():
+                yield line
+            return
+        async for line in self.resp.aiter_lines():
+            yield line
 
     async def close(self) -> None:
         """幂等关闭：释放上游流与并发槽位（on_close），重复调用安全。"""
@@ -480,21 +620,41 @@ class _Upstream:
                 pass
 
     def to_streaming(self, req_id: str) -> StreamingResponse:
-        """原样透传（/v1/messages 直通路径）。"""
+        """原样透传（/v1/messages 直通路径）。
+
+        透传不解析 body，于是 token 用量只能靠旁路嗅探：`UsageSniffer` 把流过的
+        字节攒起来（上限 1 MB），结束时解析出 usage 落台账——否则这类请求在
+        「请求监控」里的输入/输出永远是空（旧实现在这里直接丢掉了用量）。
+        """
         up = self
+        sniffer = UsageSniffer()
 
         async def _body_iter():
+            first = True
             try:
-                async for chunk in up.resp.aiter_bytes():
+                async for chunk in _paced(up.chunks()):
+                    if chunk is _KEEPALIVE:
+                        yield chunk  # 静默期心跳：不算内容，不影响首字计时
+                        continue
+                    sniffer.feed(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
+                    if first:
+                        first = False
+                        reqlog.mark_first(req_id)
+                    reqlog.mark_last(req_id)
                     yield chunk
+                reqlog.note_usage(req_id, **_usage_kwargs(sniffer.result()))
                 logs.req_ok(req_id)
                 reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code)
             except asyncio.CancelledError:
-                reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
+                reqlog.note_usage(req_id, **_usage_kwargs(sniffer.result()))
+                reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first,
+                                    outcome=reqlog.OUTCOME_CLIENT_ABORTED)
                 raise
             except Exception as err:  # noqa: BLE001
                 logs.req_err(req_id, f"流传输中断: {err}")
-                reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
+                reqlog.note_usage(req_id, **_usage_kwargs(sniffer.result()))
+                reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first,
+                                    outcome=reqlog.OUTCOME_UPSTREAM_ABORTED)
             finally:
                 await up.close()
 
@@ -504,7 +664,7 @@ class _Upstream:
 
 
 async def _try_account(req_id, account, body, incoming_headers, port, needs_captcha,
-                       slot_box: list | None = None):
+                       slot_box: list | None = None, reason: list | None = None):
     """尝试用单个账号转发，含验证码续期与可配置重试。
 
     错误处理策略（参数见 settings，均可用环境变量调整）：
@@ -526,9 +686,11 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
     model_name = str(body.get("model") or "-")
     while True:
         attempt_t0 = time.time()
-        reqlog.mark_account(req_id, account.name, account.mode)
+        reqlog.mark_account(req_id, account.name, account.mode, account.id)
         verify_param = verify_region = None
-        if needs_captcha:
+        # CLI 形态（默认）实测不需要无痕验证码：省掉 10–40s 的 Node+浏览器求解。
+        # desktop 形态保留原求解流程。
+        if needs_captcha and settings.MESSAGES_STYLE != "cli":
             _park_slot(slot_box)
             try:
                 verify_param, verify_region = await captcha_manager.get_verify_param(port)
@@ -569,11 +731,50 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             return _NEXT_ACCOUNT
 
         status_code = resp.status_code
+        preloaded: bytes | None = None
+        business_code: int | None = None
+
+        if status_code < 400:
+            # 上游对业务错误也回 200：body 是 {"code":1005,"msg":"exceed quota limit"}。
+            # 只看 content-type 就能分辨——SSE 是 text/event-stream，整体回复是
+            # application/json（可能正常，也可能是这种错误体）。不读一次就分不清，
+            # 于是这类请求会被当成成功透传出去、台账里也没有任何用量。
+            content_type = (resp.headers.get("content-type") or "").lower()
+            if "text/event-stream" not in content_type:
+                preloaded = await resp.aread()
+                business_code = _business_code(preloaded)
+                if business_code not in (None, 0):
+                    # 归一成 HTTP 语义走同一套错误分类（验证码/风控/额度/鉴权/其它）
+                    status_code = 400
 
         if status_code >= 400:
-            text = (await resp.aread()).decode("utf-8", "ignore")
+            text = (preloaded.decode("utf-8", "ignore") if preloaded is not None
+                    else (await resp.aread()).decode("utf-8", "ignore"))
             await cm.__aexit__(None, None, None)
             await client.aclose()
+
+            # 模型级额度用尽（上游 200 + code 1005「exceed quota limit」）/ 模型并发
+            # 已满（429 + code 3009「model concurrency limit exceeded」）：都是「这个
+            # 账号对这个模型」的局部状态，账号本身仍然可用。实测同一账号 GLM-5.3 还有
+            # 300 万、GLM-5.3-Flash 已用完——按 _is_exhausted 判成账号耗尽会把整号
+            # 踢出轮询，其他模型跟着挂；而对 3009 原地等 60s 会让客户端几分钟收不到
+            # 一个字节（2026-10-27 实测非流式请求因此吊死）。两种都只换号，不动状态。
+            if (business_code == 1005 or "exceed quota limit" in text.lower()
+                    or business_code == 3009 or "concurrency limit" in text.lower()):
+                busy = business_code == 3009 or "concurrency limit" in text.lower()
+                label = "并发已满" if busy else "额度用尽"
+                account.record_result(False, f"模型{label}: {model_name}")
+                logs.warn(
+                    req_id,
+                    f"账号 {account.name} 的 {model_name} {label}"
+                    f"（上游 {business_code or status_code}），换下一个账号",
+                )
+                if reason is not None:
+                    reason[0] = (f"{model_name} {label}"
+                                 f"（上游 code {business_code or status_code} · 换号后仍无可用）")
+                if not busy:
+                    _spawn_bg(_safe_refresh(account))   # 额度变了，后台刷新余额
+                return _NEXT_ACCOUNT
 
             # 验证码挑战：三形态任一命中即清池重试（不改账号状态）
             challenge = _detect_captcha_challenge(resp, text) if needs_captcha else None
@@ -785,7 +986,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         _spawn_bg(_safe_refresh(account))
 
         return _Upstream(resp, cm, client, t_first=time.time() - attempt_t0,
-                         account_name=account.name, mode=account.mode)
+                         account_name=account.name, mode=account.mode,
+                         preloaded=preloaded)
 
 
 def _safe_json(text: str):
@@ -793,6 +995,19 @@ def _safe_json(text: str):
         return json.loads(text)
     except (json.JSONDecodeError, ValueError):
         return None
+
+
+def _business_code(raw: bytes) -> int | None:
+    """从整体响应体里取上游业务码（`{"code":1005,...}`），取不到返回 None。
+
+    zcode-plan 的业务错误走 HTTP 200 + body 里的 code：1005=额度用尽、
+    3007=验证码、1001=参数……不认这个 code，失败就会被当成成功。
+    """
+    data = _safe_json(raw.decode("utf-8", "ignore"))
+    if not isinstance(data, dict):
+        return None
+    code = data.get("code")
+    return code if isinstance(code, int) else None
 
 
 async def _safe_refresh(account: Account) -> None:

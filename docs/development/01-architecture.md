@@ -62,8 +62,9 @@ zcode-hub/
 │   ├── captcha.py         # 求解器编排 + 预热池
 │   ├── oauth.py           # zai server-mediated CLI 流
 │   ├── auth_admin.py      # 后台 / 网关鉴权（后台失败节流）
-│   └── reqlog.py          # 内存环形请求日志
-├── captcha_node/          # Node + jsdom solver.js
+│   ├── reqlog.py          # 请求监控：内存环（实时）+ 台账落行口径
+│   └── usagelog.py        # 请求台账 SQLite（每请求一行：token/缓存/首字/tok·s/结果）
+├── captcha_node/          # Node + puppeteer-core solver_pw.js（真浏览器求解）
 ├── frontend/              # 后台静态页（accounts / settings / login）
 ├── tests/
 │   ├── unit/

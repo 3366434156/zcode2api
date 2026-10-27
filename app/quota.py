@@ -9,6 +9,7 @@ import asyncio
 import os
 import time
 import uuid
+from datetime import datetime
 
 import httpx
 
@@ -75,6 +76,39 @@ def _auth_headers(account: Account) -> dict:
     elif account.api_key:
         headers["x-api-key"] = account.api_key
     return headers
+
+
+def _expires_ts(raw) -> float:
+    """`expires_at` → epoch 秒；无法解析返回 0（视作「不过期」，保守保留）。
+
+    上游实测两种形态：`billing/balance` 的窗口是 unix 秒；部分字段（以及测试桩）
+    是 ISO 字符串。毫秒时间戳（> 1e12）顺手归一。
+    """
+    if isinstance(raw, bool):
+        return 0.0
+    if isinstance(raw, (int, float)):
+        ts = float(raw)
+        if ts <= 0:
+            return 0.0
+        return ts / 1000.0 if ts > 1e12 else ts
+    if isinstance(raw, str) and raw.strip():
+        text = raw.strip().replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(text).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _window_expired(expires_at, now: float) -> bool:
+    """窗口是否已到期（到期时刻 <= now）。
+
+    上游 `billing/balance` 在日切（本地 09:00）之后仍会把上一窗口列出来、且
+    `remaining` 还是旧数字——那部分额度已经不可用，展示与统计都必须忽略，
+    否则后台会长期显示「已经消失的额度」。
+    """
+    ts = _expires_ts(expires_at)
+    return bool(ts) and ts <= now
 
 
 def _bonus_active(plan: dict, now: float) -> bool:
@@ -161,10 +195,13 @@ async def fetch_quota(account: Account) -> dict:
             pass
 
     quota_map: dict = {}
+    balance_ok = False
+    expired_windows = 0
     if balance_res is not None and balance_res.status_code == 200:
         try:
             data = balance_res.json()
             result["balance"] = data
+            balance_ok = True
             for bal in (data.get("data") or {}).get("balances") or []:
                 name = bal.get("show_name") or bal.get("model") or "model"
                 window = {
@@ -173,6 +210,11 @@ async def fetch_quota(account: Account) -> dict:
                     "remaining": bal.get("remaining_units"),
                     "expires_at": bal.get("expires_at"),
                 }
+                if _window_expired(window.get("expires_at"), now):
+                    # 日切后上游 balance 仍会列出上一窗口且 remaining 是旧数字：
+                    # 额度已不可用，展示 / 统计 / 耗尽判定一律忽略（不落库）
+                    expired_windows += 1
+                    continue
                 prev = quota_map.get(name)
                 if prev:
                     # 防御：同模型多窗口（如日窗 + 一次性）合并，避免后者覆盖前者
@@ -182,8 +224,10 @@ async def fetch_quota(account: Account) -> dict:
                     logs.warn("quota", f"balance 同名窗口 {name} 已合并")
                 else:
                     quota_map[name] = window
+            if expired_windows:
+                result["expired_windows"] = expired_windows
         except (ValueError, KeyError):
-            pass
+            balance_ok = False
 
     if usage_res is not None and usage_res.status_code == 200:
         try:
@@ -192,8 +236,12 @@ async def fetch_quota(account: Account) -> dict:
         except (ValueError, KeyError):
             pass
 
-    if quota_map:
+    if balance_ok:
+        # 以本次 balance 为准落库（哪怕过滤后为空）：清掉上一轮残留的过期窗口，
+        # 否则后台会一直显示「已经消失的额度」，耗尽判定也会被旧数字带偏
         account.quota = quota_map
+
+    if quota_map:
         # 额度耗尽判定：所有日窗口剩余 <= 0。注意 balance 不含一次性赠送池——
         # 赠送池有效时不判耗尽，否则账号会被路由跳过而实际仍有 3 亿级可用额度
         now = time.time()
@@ -285,3 +333,4 @@ class QuotaMonitor:
 
 
 monitor = QuotaMonitor()
+

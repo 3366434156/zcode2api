@@ -44,6 +44,12 @@ def _bool(env_name: str, default: bool) -> bool:
 DATA_DIR = _resolve_path("ZCODE_DATA_DIR", "data")
 # 账号与设置持久化到本地 SQLite（与 grok2api 的 local 后端一致）
 DB_PATH = DATA_DIR / "accounts.db"
+# 请求用量台账（每请求一行：token / 缓存命中 / 首字 / 生成速度 / 结果）
+# 单独一个库：写入频率远高于账号库，且需要独立保留策略与聚合查询
+USAGE_DB_PATH = _resolve_path("ZCODE_USAGE_DB", str(DATA_DIR / "usage.db"))
+# 台账保留：先按天数裁，再按行数裁（0 = 该轴不限）
+USAGE_RETENTION_DAYS = _int("ZCODE_USAGE_RETENTION_DAYS", 30)
+USAGE_MAX_ROWS = _int("ZCODE_USAGE_MAX_ROWS", 50_000)
 # 前端目录（前后端分离）：默认仓库根 frontend/，可用 ZCODE_FRONTEND_DIR 指向
 # 独立部署目录（线上 /data/zcode-hub/frontend）；包内 statics 仅作兜底
 FRONTEND_DIR = _resolve_path(
@@ -76,8 +82,42 @@ CAPTCHA_SOLVER_MODE = (os.getenv("ZCODE_CAPTCHA_SOLVER", "pw").strip().lower() o
 CAPTCHA_SOLVER_JS = CAPTCHA_SOLVER_DIR / (
     "solver.js" if CAPTCHA_SOLVER_MODE == "legacy" else "solver_pw.js"
 )
-# Chromium 可执行文件（solver_pw.js 用；env 可覆盖，缺省按常见路径探测）
-CHROMIUM_PATH = os.getenv("ZCODE_CHROMIUM_PATH", "/usr/local/bin/chromium")
+# Chromium 可执行文件（solver_pw.js 用）：env 优先，其次按平台常见安装路径探测。
+# 探测的每一项就是"这台机器上最可能装着的那个"：Windows 上 Edge 是系统预装的
+# Chromium，Linux/macOS 上常见的是发行版 chromium 与 Google Chrome。全都不存在
+# 时返回首选项，让 solver 报出可读的错误（提示设 ZCODE_CHROMIUM_PATH）。
+_CHROMIUM_CANDIDATES = (
+    [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    ]
+    if os.name == "nt"
+    else [
+        "/usr/local/bin/chromium",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    ]
+)
+
+
+def _find_chromium() -> str:
+    """求解器用的浏览器路径：env 覆盖 > 平台常见路径里第一个真实存在的。"""
+    override = os.getenv("ZCODE_CHROMIUM_PATH", "").strip()
+    if override:
+        return override
+    for path in _CHROMIUM_CANDIDATES:
+        if path and os.path.exists(path):
+            return path
+    return _CHROMIUM_CANDIDATES[0]
+
+
+CHROMIUM_PATH = _find_chromium()
 CAPTCHA_SOLVE_RETRIES = _int("ZCODE_CAPTCHA_RETRIES", 4)
 # 每次求解超时（秒）：真浏览器含 launch（内存压力下可 30s+）+ SDK 加载 + 无痕验证，
 # 且 solver 进程内自旋重试 3 次（约 40s×3），须容得下
@@ -115,6 +155,17 @@ RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
 # ——「风控后换设备重生」语义自动化，账号重新启用时即全新身份
 # 单账号并发上限（0 = 不限）。默认 2；运行期可在后台设置改（meta 表即时生效）
 ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 2)
+# ── 流式保活 / 会话粘性（对齐 magpie 的 keepHeldAfter 与 affinity）────────────
+# SSE 心跳：客户端空闲超过该秒数就补一条注释帧 `: keep-alive`。模型思考阶段
+# 上游可能长时间只发 thinking 事件，没有心跳客户端只会显示「未响应」。
+# 15s 与 magpie 的 keepaliveEvery 同值
+SSE_KEEPALIVE_IDLE = _int("ZCODE_SSE_KEEPALIVE_IDLE", 15)
+# 上游彻底静默的上限（秒）：httpx 的 read 超时是 None（长回复不能设总时长上限），
+# 没有这层看门狗，半死的 TCP 连接会把请求永久挂起。默认 600s 远大于实测思考时长
+UPSTREAM_STALL_SECONDS = _int("ZCODE_UPSTREAM_STALL", 600)
+# 会话粘性有效期（秒）：同一段对话在有效期内优先回到上次回答它的账号，
+# 让上游的前缀缓存能继续命中（换号 = 整段 prompt 重新读一遍，命中归零）
+AFFINITY_TTL = _int("ZCODE_AFFINITY_TTL", 1800)
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。
 # 默认 3600（2.6.5 整改）：zcode-switch 参照系下 preview/领取只在用户点界面
@@ -130,6 +181,12 @@ UPSTREAM = {
     "bigmodel": os.getenv("BIGMODEL_UPSTREAM_URL", constants.MESSAGES_URLS["bigmodel"]),
 }
 
+# messages 通道请求形态（2026-10-26 实证）：
+#   "cli"（默认）—— 官方 ZCode CLI 形态头 + Bearer/x-api-key 双带，system 仅前置官方
+#          前两块原文；**不需要**阿里云无痕验证码。上游 3.16.x 实测 200。
+#   "desktop"  —— 旧行为（@electron 仿真头 + aliyun 验证码）；3.16.x 起 messages 恒 405/3012。
+MESSAGES_STYLE = (os.getenv("ZCODE_MESSAGES_STYLE", "cli").strip().lower() or "cli")
+
 # ZCode 计费 / 额度查询端点
 ZCODE_BILLING_BASE = constants.BILLING_BASE
 # 激活事件上报（测试时指向 Mock 上游）
@@ -140,7 +197,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.6.8"
+APP_VERSION = "2.6.9"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 

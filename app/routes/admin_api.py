@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
 
 import httpx
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 
 from .. import logs, reqlog
 from ..auth_admin import verify_admin_key
@@ -25,6 +26,7 @@ from ..models import PROVIDERS, Status
 from ..oauth import ZaiAuthFlow
 from ..quota import fetch_quota, refresh_accounts
 from ..store import store
+from ..usagelog import usagelog
 
 router = APIRouter(prefix="/admin/api", dependencies=[Depends(verify_admin_key)])
 
@@ -543,6 +545,162 @@ async def claim_manual(payload: dict = Body(...)):
             "summary": {"ok": 1, "fail": 0}}
 
 
+# ── 客户端一键接入（magpie 等）────────────────────────────────────────────────
+def _gateway_base_from_request(request: Request) -> str:
+    """看板所在浏览器访问网关用的地址；非回环绑定一律回落 127.0.0.1。"""
+    from .. import settings as app_settings
+
+    host = (request.url.hostname or "").strip()
+    if host in ("", "0.0.0.0", "::", "::1"):
+        host = "127.0.0.1"
+    port = request.url.port or app_settings.PORT
+    return f"http://{host}:{port}"
+
+
+def _clients():
+    from .. import clients as clients_module
+
+    return clients_module
+
+
+@router.get("/agents")
+async def agents_overview(request: Request):
+    """客户端接入看板：安装/接入状态、网关地址、magpie 导入链接。"""
+    return _clients().overview(
+        base_url=_gateway_base_from_request(request),
+        api_key=store.gateway_key(),
+    )
+
+
+@router.post("/agents/apply")
+async def agents_apply(request: Request, payload: dict = Body(...)):
+    """一键接入：把本网关写进客户端配置（写前备份、原子落盘、可还原）。"""
+    clients = _clients()
+    client_id = str(payload.get("client") or payload.get("client_id") or "").strip()
+    if not client_id:
+        raise HTTPException(400, "缺少 client")
+    base_url = str(payload.get("base_url") or "").strip() or _gateway_base_from_request(request)
+    models = payload.get("models")
+    if models is not None and not isinstance(models, list):
+        raise HTTPException(400, "models 必须是字符串数组")
+    try:
+        report = await asyncio.to_thread(
+            clients.integrate, client_id,
+            base_url=base_url, api_key=store.gateway_key(),
+            models=[str(m) for m in models] if models else None,
+        )
+    except clients.AgentConfigError as err:
+        raise HTTPException(400, str(err)) from None
+    except OSError as err:
+        raise HTTPException(500, f"写入失败: {err}") from None
+    return {"ok": True, **report}
+
+
+@router.post("/agents/restore")
+async def agents_restore(payload: dict = Body(...)):
+    """一键还原：回到首次接入前的配置（外部改过的文件只摘掉本网关的 provider）。"""
+    clients = _clients()
+    client_id = str(payload.get("client") or payload.get("client_id") or "").strip()
+    if not client_id:
+        raise HTTPException(400, "缺少 client")
+    try:
+        result = await asyncio.to_thread(clients.restore, client_id)
+    except clients.AgentConfigError as err:
+        raise HTTPException(400, str(err)) from None
+    except OSError as err:
+        raise HTTPException(500, f"还原失败: {err}") from None
+    return {"ok": True, **result}
+
+
+@router.post("/agents/magpie/share")
+async def agents_magpie_share(request: Request):
+    """一键把本机 magpie 设成共享端：打开局域网共享 + 备好网关 Key。
+
+    对应 magpie 自己的「另一台电脑上的 magpie（Remote magpie）」：对端只要执行返回的
+    一行命令即可用上这台机器的 provider（含 zcode2api）。
+    """
+    clients = _clients()
+    try:
+        sharing = await asyncio.to_thread(clients.enable_magpie_sharing)
+        key = await asyncio.to_thread(clients.magpie_gateway_key)
+    except clients.AgentConfigError as err:
+        raise HTTPException(400, str(err)) from None
+    except OSError as err:
+        raise HTTPException(500, f"配置 magpie 失败: {err}") from None
+    plan = await asyncio.to_thread(
+        clients.remote_share_plan,
+        base_url=_gateway_base_from_request(request),
+        api_key=store.gateway_key(),
+    )
+    return {
+        "ok": True,
+        "sharing": sharing,
+        "key": {"id": key["id"], "name": key["name"], "secret": key["secret"],
+                "created": key["created"]},
+        "magpie": plan["magpie"],
+        "restart_hint": plan["magpie"].get("reachable") is False,
+    }
+
+
+@router.post("/agents/gateway-key")
+async def agents_gateway_key(request: Request):
+    """生成一个新的网关 API Key 并立即生效（其它电脑直连本网关时使用）。
+
+    注意：一旦设置，所有调用 `/v1/*` 的客户端都必须带上这个 Key。已接入的客户端
+    （本机 magpie 的 provider 条目）会就地刷新成新 Key，避免本机自己先被 401。
+    """
+    token = "sk-zcode-" + secrets.token_hex(16)
+    store.set_setting("gateway_key", token)
+    logs.step("agents", "已生成新的网关 API Key（其它电脑直连时使用）")
+    clients = _clients()
+    base = _gateway_base_from_request(request)
+    refreshed: list[str] = []
+    for client_id in clients.configured_clients():
+        try:
+            await asyncio.to_thread(clients.integrate, client_id,
+                                    base_url=base, api_key=token)
+            refreshed.append(client_id)
+        except (clients.AgentConfigError, OSError) as err:  # 单个客户端失败不阻断
+            logs.warn("agents", f"{client_id} 刷新新 Key 失败: {err}")
+    return {"ok": True, "gateway_key": token, "masked": _mask_secret(token),
+            "refreshed_clients": refreshed}
+
+
+@router.post("/agents/magpie/sync-now")
+async def agents_magpie_sync_now():
+    """立刻做一次 magpie 加密同步（推送本机改动 / 拉取仓库改动）。"""
+    clients = _clients()
+    try:
+        return {"ok": True, **await asyncio.to_thread(clients.magpie_sync_now)}
+    except clients.AgentConfigError as err:
+        raise HTTPException(400, str(err)) from None
+    except OSError as err:
+        raise HTTPException(500, f"同步失败: {err}") from None
+
+
+@router.post("/agents/magpie/sync")
+async def agents_magpie_sync(payload: dict = Body(...)):
+    """从后台开启 GitHub 加密同步（token/口令经 stdin 交给 magpie，不落命令行）。"""
+    clients = _clients()
+    repo = str(payload.get("repo") or "").strip()
+    token = str(payload.get("token") or "").strip()
+    passphrase = str(payload.get("passphrase") or "").strip()
+    if not repo or not token or not passphrase:
+        raise HTTPException(400, "缺少 repo / token / passphrase")
+    try:
+        result = await asyncio.to_thread(
+            clients.enable_magpie_sync, repo=repo, token=token, passphrase=passphrase,
+            keys=bool(payload.get("keys", True)),
+            agents=bool(payload.get("agents", True)),
+            library=bool(payload.get("library", True)),
+        )
+    except clients.AgentConfigError as err:
+        raise HTTPException(400, str(err)) from None
+    except OSError as err:
+        raise HTTPException(500, f"开启同步失败: {err}") from None
+    return {"ok": True, **result}
+
+
 # ── 设置 ─────────────────────────────────────────────────────────────────────
 def _mask_secret(value: str) -> str:
     if not value:
@@ -627,13 +785,68 @@ async def import_accounts(payload: dict = Body(...)):
 
 
 # ── 请求监控 ─────────────────────────────────────────────────────────────────
+_RANGE_SECONDS = {"1h": 3600, "6h": 6 * 3600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
+
+
+def _range_start(range_key: str) -> float:
+    """时间范围 → 起始时间戳。today = 本地零点（用户看到的是本地日期）。"""
+    if range_key == "today":
+        lt = time.localtime()
+        return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    seconds = _RANGE_SECONDS.get(range_key)
+    return time.time() - seconds if seconds else 0.0
+
+
+def _usage_filter(range_key: str, outcome: str, account: str, model: str,
+                  q: str) -> tuple[str, tuple]:
+    """拼出明细/聚合共用的 WHERE（两处口径必须一致，否则统计与列表对不上）。"""
+    clauses: list[str] = ["ts >= ?"]
+    params: list = [_range_start(range_key)]
+    if outcome == "fail":
+        clauses.append("outcome <> 'completed'")
+    elif outcome and outcome != "all":
+        clauses.append("outcome = ?")
+        params.append(outcome)
+    if account:
+        clauses.append("account = ?")
+        params.append(account)
+    if model:
+        clauses.append("model = ?")
+        params.append(model)
+    if q:
+        clauses.append("(preview LIKE ? OR error LIKE ? OR model LIKE ? OR account LIKE ?)")
+        like = f"%{q}%"
+        params.extend([like, like, like, like])
+    return " AND ".join(clauses), tuple(params)
+
+
 @router.get("/monitoring")
 async def monitoring():
-    """网关请求环形日志（内存态，重启清零）。前端自行聚合统计。"""
+    """实时视图：内存环（含进行中，重启清零）。明细/聚合请用 /usage。"""
     return {"entries": reqlog.snapshot(), "keep": reqlog.KEEP}
+
+
+@router.get("/usage")
+async def usage(range: str = "today", outcome: str = "all", account: str = "",
+                model: str = "", q: str = "", limit: int = 100, offset: int = 0):
+    """请求台账：分页明细 + 区间聚合（SQL 侧统计，翻页不改变口径）。"""
+    usagelog.flush()   # 让刚结束的请求当场可见（写入是异步批量的）
+    where, params = _usage_filter(range, outcome, account, model, q)
+    rows, total = usagelog.query(where, params, limit=limit, offset=offset)
+    return {
+        "rows": rows,
+        "total": total,
+        "limit": max(1, min(int(limit), usagelog.MAX_PAGE)),
+        "offset": max(0, int(offset)),
+        "stats": usagelog.stats(where, params),
+        "by_account": usagelog.group_by("account", where, params),
+        "by_model": usagelog.group_by("model", where, params),
+        "series": usagelog.series(where, params),
+    }
 
 
 @router.post("/monitoring/clear")
 async def monitoring_clear():
+    """清空实时环与持久台账。"""
     reqlog.clear()
     return {"ok": True}

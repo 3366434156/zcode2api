@@ -152,3 +152,33 @@ def transform_body(body: dict, user_id: str | None = None, model: str | None = N
     except Exception:  # noqa: BLE001 - 变换永不放大请求失败
         pass
     return body
+
+
+# 风控校验只认官方提示词**前两块**原文（orangeTZ07/zcode-plan-bridge 抓包 + 二分实测）
+_CLI_MARKER: list[dict] = _ZCODE_SYSTEM_BLOCKS[:2]
+
+
+def apply_cli_system(body: dict) -> bool:
+    """CLI 形态：system 仅前置官方前两块原文，其余字段一概不动。幂等。"""
+    if not _CLI_MARKER:
+        return False
+    existing = body.get("system")
+    if isinstance(existing, list) and existing:
+        first = existing[0]
+        if isinstance(first, dict) and first.get("text") == _CLI_MARKER[0].get("text"):
+            return False  # 已前置
+    body["system"] = [copy.deepcopy(b) for b in _CLI_MARKER] + _normalize_user_system(existing)
+    return True
+
+
+def transform_body_cli(body: dict) -> dict:
+    """CLI 形态 body 变换：只做 system marker 前缀，不注入 cache_control / user_id。
+
+    实测（2026-10-26）：多注入第 3 个 system 块或改写其余字段都会抬高被拒概率，
+    官方 CLI 请求除 system 前缀外与调用方 body 完全一致。
+    """
+    try:
+        apply_cli_system(body)
+    except Exception:  # noqa: BLE001
+        pass
+    return body

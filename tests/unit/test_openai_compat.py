@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import json
 
-from app.openai_compat import StreamConverter, anthropic_to_openai, openai_to_anthropic
+from app.openai_compat import (
+    StreamConverter,
+    UsageSniffer,
+    anthropic_to_openai,
+    openai_to_anthropic,
+)
 
 
 class TestOpenaiToAnthropic:
@@ -169,6 +174,27 @@ class TestAnthropicToOpenai:
         }, "GLM-5.3")
         assert out["choices"][0]["finish_reason"] == "length"
 
+    def test_thinking_block_becomes_reasoning_content(self):
+        """非流式：thinking 块映射到 message.reasoning_content。"""
+        out = anthropic_to_openai({
+            "id": "m", "type": "message",
+            "content": [{"type": "thinking", "thinking": "先算一下"},
+                        {"type": "text", "text": "答案是 4"}],
+            "stop_reason": "end_turn", "usage": {"input_tokens": 10, "output_tokens": 3},
+        }, "GLM-5.3")
+        message = out["choices"][0]["message"]
+        assert message["reasoning_content"] == "先算一下"
+        assert message["content"] == "答案是 4"
+
+    def test_cached_tokens_reported(self):
+        """缓存命中按 OpenAI 标准放进 prompt_tokens_details.cached_tokens。"""
+        out = anthropic_to_openai({
+            "id": "m", "type": "message", "content": [{"type": "text", "text": "x"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 2, "cache_read_input_tokens": 4096},
+        }, "GLM-5.3")
+        assert out["usage"]["prompt_tokens_details"]["cached_tokens"] == 4096
+
 
 def _parse_sse(s: str) -> list[dict]:
     return [json.loads(line[5:]) for line in s.splitlines() if line.startswith("data: ") and line != "data: [DONE]"]
@@ -223,3 +249,90 @@ class TestStreamConverter:
         conv.start()
         assert conv.feed({"type": "ping"}) == []
         assert conv.feed({"type": "content_block_stop", "index": 0}) == []
+
+    def test_thinking_delta_becomes_reasoning_content(self):
+        """流式：thinking_delta 必须转成 delta.reasoning_content。
+
+        否则模型整段思考期间客户端收不到任何字节，界面只能显示「未响应」
+        （本机实测：1996 条 thinking_delta 被丢弃 → 客户端静默 39s）。
+        """
+        conv = StreamConverter("GLM-5.3")
+        conv.start()
+        assert conv.feed({"type": "content_block_start", "index": 0,
+                          "content_block": {"type": "thinking", "thinking": ""}}) == []
+        outs = conv.feed({"type": "content_block_delta", "index": 0,
+                          "delta": {"type": "thinking_delta", "thinking": "推理中"}})
+        chunks = _parse_sse("".join(outs))
+        assert chunks[0]["choices"][0]["delta"] == {"reasoning_content": "推理中"}
+
+    def test_signature_delta_ignored_after_thinking(self):
+        """signature_delta 是思考块的签名，不产生任何客户端可见内容。"""
+        conv = StreamConverter("GLM-5.3")
+        conv.start()
+        conv.feed({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "thinking", "thinking": ""}})
+        assert conv.feed({"type": "content_block_delta", "index": 0,
+                          "delta": {"type": "signature_delta", "signature": "abc"}}) == []
+        assert conv.feed({"type": "content_block_stop", "index": 0}) == []
+
+    def test_stream_cached_tokens_in_finish_chunk(self):
+        """流式：缓存命中从 message_start / message_delta 带到 usage。"""
+        conv = StreamConverter("GLM-5.3")
+        conv.feed({"type": "message_start", "message": {
+            "id": "m", "usage": {"input_tokens": 10, "cache_read_input_tokens": 2048}}})
+        outs = conv.feed({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                          "usage": {"output_tokens": 5}})
+        finish = _parse_sse("".join(outs))[0]
+        assert finish["usage"]["prompt_tokens_details"]["cached_tokens"] == 2048
+        assert finish["usage"]["total_tokens"] == 15
+        assert conv.feed({"type": "message_stop"}) == []  # 结束事件不产出内容
+
+    def test_prompt_tokens_from_message_delta(self):
+        """输入侧真实数字常常只在 message_delta（message_start 报 0）。"""
+        conv = StreamConverter("GLM-5.3")
+        conv.feed({"type": "message_start", "message": {
+            "id": "m", "usage": {"input_tokens": 0}}})
+        outs = conv.feed({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                          "usage": {"input_tokens": 70, "output_tokens": 43,
+                                    "cache_read_input_tokens": 192}})
+        usage = _parse_sse("".join(outs))[0]["usage"]
+        assert usage["prompt_tokens"] == 70
+        assert usage["completion_tokens"] == 43
+        assert usage["prompt_tokens_details"]["cached_tokens"] == 192
+
+
+class TestUsageSniffer:
+    """/v1/messages 透传路径的用量嗅探：不解析 body 也能统计 token。"""
+
+    def test_stream_events(self):
+        sniffer = UsageSniffer()
+        sniffer.feed(
+            b'event: message_start\ndata: {"type":"message_start","message":'
+            b'{"usage":{"input_tokens":69,"cache_read_input_tokens":192}}}\n\n'
+            b'event: content_block_delta\ndata: {"type":"content_block_delta",'
+            b'"delta":{"type":"text_delta","text":"hi"}}\n\n'
+            b'event: message_delta\ndata: {"type":"message_delta",'
+            b'"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":43}}\n\n'
+        )
+        assert sniffer.result() == {"input_tokens": 69, "output_tokens": 43,
+                                    "cache_read_input_tokens": 192}
+
+    def test_whole_json_reply(self):
+        sniffer = UsageSniffer()
+        sniffer.feed(b'{"type":"message","usage":{"input_tokens":10,"output_tokens":2,')
+        sniffer.feed(b'"cache_read_input_tokens":30}}\n')
+        assert sniffer.result() == {"input_tokens": 10, "output_tokens": 2,
+                                    "cache_read_input_tokens": 30}
+
+    def test_error_body_yields_nothing(self):
+        """业务错误体里没有 usage：嗅探结果为空（台账据此标 usage_missing）。"""
+        sniffer = UsageSniffer()
+        sniffer.feed(b'{"code":1005,"msg":"exceed quota limit"}')
+        assert sniffer.result() == {}
+
+    def test_overflow_gives_up_instead_of_buffering_forever(self):
+        """超过 1 MB 直接放弃统计，不把整条流攒在内存里。"""
+        sniffer = UsageSniffer()
+        sniffer.feed(b"x" * (UsageSniffer.MAX_BUF + 1))
+        sniffer.feed(b'{"type":"message","usage":{"input_tokens":1}}')
+        assert sniffer.result() == {}

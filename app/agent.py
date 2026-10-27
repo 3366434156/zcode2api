@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 
 from . import body_transform, constants, settings
-from .identity import build_identity_headers, build_trace_headers
+from .identity import build_cli_identity_headers, build_identity_headers, build_trace_headers
 from .models import Account
 
 # 透传客户端 header 时需要剔除的字段
@@ -91,17 +91,29 @@ def build_request(
         raise RuntimeError(f"未知提供商: {provider}")
 
     if provider == "zai" and account.uses_plan_channel() and not force_fallback:
-        # JWT 通道：全量身份头 + 追踪头（对齐官方客户端 pio + trace 头序）
-        user_id = body_transform.jwt_user_id(account.jwt_token)
-        model = body.get("model") if isinstance(body.get("model"), str) else None
-        body = body_transform.transform_body(body, user_id, model)
-        headers = {
-            "content-type": "application/json",
-            **auth,
-            "anthropic-version": constants.ANTHROPIC_VERSION,
-            **build_identity_headers(account),
-            **build_trace_headers(),
-        }
+        if settings.MESSAGES_STYLE == "desktop":
+            # 旧桌面端仿真形态（3.16.x 起被上游 3012，保留可切换以便回归）
+            user_id = body_transform.jwt_user_id(account.jwt_token)
+            model = body.get("model") if isinstance(body.get("model"), str) else None
+            body = body_transform.transform_body(body, user_id, model)
+            headers = {
+                "content-type": "application/json",
+                **auth,
+                "anthropic-version": constants.ANTHROPIC_VERSION,
+                **build_identity_headers(account),
+                **build_trace_headers(),
+            }
+        else:
+            # CLI 形态（默认）：Bearer + x-api-key 双带，system 只前置官方前两块，
+            # 其余 body 原样透传（实测上游 3012 的判定点就在这里）。
+            auth = {**auth, "x-api-key": account.jwt_token}
+            body = body_transform.transform_body_cli(body)
+            headers = {
+                "content-type": "application/json",
+                **auth,
+                "anthropic-version": constants.ANTHROPIC_VERSION,
+                **build_cli_identity_headers(account),
+            }
     else:
         # API Key 通道（回退 / bigmodel）：保持原有最小头集
         headers = {

@@ -239,17 +239,21 @@ class CaptchaManager:
             settings.NODE_PATH, str(solver), scene, region, prefix,
             cwd=str(settings.CAPTCHA_SOLVER_DIR),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,   # 失败原因只在 stderr，必须留下来
             env=solver_env,
         )
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=settings.CAPTCHA_SOLVE_TIMEOUT)
-        except TimeoutError:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=settings.CAPTCHA_SOLVE_TIMEOUT
+            )
+        except TimeoutError as err:
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
-            return None
+            raise RuntimeError(
+                f"求解超时（{settings.CAPTCHA_SOLVE_TIMEOUT}s 未返回）"
+            ) from err
         except FileNotFoundError as err:
             raise RuntimeError(f"无法启动 Node（{settings.NODE_PATH}）: {err}") from err
 
@@ -257,6 +261,13 @@ class CaptchaManager:
         for line in stdout.decode("utf-8", "ignore").splitlines():
             if line.startswith("VERIFY_PARAM="):
                 param = line[len("VERIFY_PARAM="):].strip()
+        if not param:
+            # 求解器把原因写在 stderr（如「未找到可执行 Chromium」）：原样带出来，
+            # 否则上层只能看到一句「多次重试无结果」，排查等于瞎猜
+            tail = (stderr.decode("utf-8", "ignore").strip().splitlines() or [""])[-1]
+            raise RuntimeError(
+                f"求解器未返回 verifyParam（退出码 {proc.returncode}）: {tail.strip() or '无 stderr 输出'}"
+            )
         return param
 
     # ── 失效 ─────────────────────────────────────────────────────────────────

@@ -13,6 +13,72 @@ import pytest
 _GOOD_JWT = "hO.eyJzdWIiOiJvIn0.sig"
 
 
+def _last_messages_body(mock) -> dict:
+    """最近一次 messages 调用的请求体。
+
+    mock.state.calls 是会话级共享记录，后台 billing 刷新（GET，空 body）
+    随时可能追加在后面，所以不能直接取 calls[-1]。
+    """
+    for _method, path, _headers, body in reversed(mock.state.calls):
+        if path.endswith("/v1/messages"):
+            return json.loads(body)
+    raise AssertionError("没有收到任何 messages 调用")
+
+
+def _bind_of(secret: str) -> str:
+    """mock 侧按凭证前缀分场景（_bind_key = cred[:16]）。"""
+    return secret[:16]
+
+
+@pytest.mark.integration
+class TestUpstreamBusinessError:
+    """上游「HTTP 200 + body 里的 code」不得被当成成功。"""
+
+    async def test_200_with_code_is_a_failure(self, gateway_client, fresh_app):
+        """额度用尽（code 1005）是 200 响应：旧实现会原样透传给客户端当成功。"""
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _GOOD_JWT, name="biz-quota")
+        mock.state.sequences[_bind_of(_GOOD_JWT)] = ["business_quota_200"]
+        try:
+            res = await client.post(
+                "/v1/chat/completions",
+                json={"model": "glm-5.3", "messages": [{"role": "user", "content": "hi"}]},
+            )
+        finally:
+            mock.state.sequences.pop(_bind_of(_GOOD_JWT), None)
+        assert res.status_code == 503
+        assert "额度" in res.json()["error"]["message"]
+
+    async def test_concurrency_limit_rotates_without_waiting(self, gateway_client, fresh_app,
+                                                             monkeypatch):
+        """code 3009 是并发已满：换号即可，不能原地等 60s 把客户端吊住。"""
+        client, mock = gateway_client
+        from app.routes import gateway as gateway_module
+        from tests.conftest import seed_account
+
+        waited: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            waited.append(seconds)
+
+        monkeypatch.setattr(gateway_module, "_sleep", fake_sleep)
+        seed_account(fresh_app, _GOOD_JWT, name="biz-3009")
+        mock.state.sequences[_bind_of(_GOOD_JWT)] = ["business_concurrency_429"]
+        try:
+            res = await client.post(
+                "/v1/chat/completions",
+                json={"model": "glm-5.3", "messages": [{"role": "user", "content": "hi"}]},
+            )
+        finally:
+            mock.state.sequences.pop(_bind_of(_GOOD_JWT), None)
+        assert res.status_code == 503
+        assert "并发" in res.json()["error"]["message"]
+        assert waited == []           # 一次都没进入 429 等待
+
+
+
 @pytest.mark.integration
 class TestChatCompletions:
     async def test_nonstream_basic(self, gateway_client, fresh_app):
@@ -50,7 +116,7 @@ class TestChatCompletions:
                                {"role": "user", "content": "hi"}]},
         )
         assert res.status_code == 200
-        payload = json.loads(mock.state.calls[-1][3])
+        payload = _last_messages_body(mock)
         assert payload["system"][-1]["text"] == "守则"  # 用户 system 位于官方身份块之后
 
     async def test_max_tokens_clamped_to_upstream_limit(self, gateway_client, fresh_app):
@@ -65,7 +131,7 @@ class TestChatCompletions:
                   "messages": [{"role": "user", "content": "hi"}]},
         )
         assert res.status_code == 200
-        payload = json.loads(mock.state.calls[-1][3])
+        payload = _last_messages_body(mock)
         assert payload["max_tokens"] == 131072
 
     async def test_max_tokens_string_form_clamped(self, gateway_client, fresh_app):
@@ -80,7 +146,7 @@ class TestChatCompletions:
                   "messages": [{"role": "user", "content": "hi"}]},
         )
         assert res.status_code == 200
-        payload = json.loads(mock.state.calls[-1][3])
+        payload = _last_messages_body(mock)
         assert payload["max_tokens"] == 131072
 
     async def test_max_tokens_floor_and_passthrough(self, gateway_client, fresh_app):
@@ -94,7 +160,7 @@ class TestChatCompletions:
                   "messages": [{"role": "user", "content": "hi"}]},
         )
         assert res.status_code == 200
-        payload = json.loads(mock.state.calls[-1][3])
+        payload = _last_messages_body(mock)
         assert payload["max_tokens"] == 1024  # 合法值原样透传
 
     async def test_stream_returns_openai_chunks(self, gateway_client, fresh_app):
@@ -118,6 +184,86 @@ class TestChatCompletions:
         assert "chunk-0" in text
         finishes = [c["choices"][0]["finish_reason"] for c in chunks if c["choices"][0]["finish_reason"]]
         assert finishes == ["stop"]
+
+    async def test_stream_forwards_reasoning_content(self, gateway_client, fresh_app):
+        """思考块必须实时下发为 reasoning_content。
+
+        否则模型整段思考期间客户端收不到任何字节，界面只能显示「未响应」
+        ——这正是本机实测的根因（1996 条 thinking_delta 被丢弃，客户端静默 39s）。
+        """
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _GOOD_JWT, name="oai-think")
+        mock.state.sse_thinking = True
+        try:
+            res = await client.post(
+                "/v1/chat/completions",
+                json={"model": "glm-5.3-flash", "stream": True,
+                      "messages": [{"role": "user", "content": "hi"}]},
+            )
+        finally:
+            mock.state.sse_thinking = False
+        assert res.status_code == 200
+        lines = [ln for ln in res.text.splitlines() if ln.startswith("data: ")]
+        chunks = [json.loads(ln[6:]) for ln in lines[:-1]]
+        reasoning = "".join(c["choices"][0]["delta"].get("reasoning_content") or "" for c in chunks)
+        assert reasoning == "想一想"
+        text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks)
+        assert "chunk-0" in text
+        usage = next(c["usage"] for c in chunks if c["choices"][0]["finish_reason"])
+        assert usage["prompt_tokens_details"]["cached_tokens"] == 1024
+
+    async def test_stream_keepalive_during_upstream_silence(
+            self, gateway_client, fresh_app, monkeypatch):
+        """上游静默期补 SSE 注释帧：客户端与中间代理都能判断连接还活着。"""
+        client, mock = gateway_client
+        from app import settings as settings_module
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _GOOD_JWT, name="oai-keepalive")
+        monkeypatch.setattr(settings_module, "SSE_KEEPALIVE_IDLE", 0.05)
+        mock.state.sse_gap = 0.2
+        try:
+            res = await client.post(
+                "/v1/chat/completions",
+                json={"model": "glm-5.3-flash", "stream": True,
+                      "messages": [{"role": "user", "content": "hi"}]},
+            )
+        finally:
+            mock.state.sse_gap = 0
+        assert res.status_code == 200
+        assert ": keep-alive" in res.text       # 心跳确实发出
+        assert "chunk-0" in res.text            # 且不影响正文
+        assert res.text.rstrip().endswith("[DONE]")
+
+    async def test_same_conversation_sticks_to_one_account(self, gateway_client, fresh_app):
+        """同一段对话回到同一账号（上游前缀缓存才能继续命中）；换对话才轮询。"""
+        client, mock = gateway_client
+        from app import affinity
+        from tests.conftest import seed_account
+
+        affinity.reset()
+        seed_account(fresh_app, "jwt-aaaa", name="sticky-1")
+        seed_account(fresh_app, "jwt-bbbb", name="sticky-2")
+
+        def last_cred() -> str:
+            """最近一次 messages 调用用的凭证（跳过 billing 等后台请求）。"""
+            for _method, path, headers, _body in reversed(mock.state.calls):
+                if path.endswith("/v1/messages"):
+                    return headers.get("authorization") or headers.get("x-api-key") or ""
+            return ""
+
+        same = {"model": "glm-5.3-flash", "messages": [{"role": "user", "content": "同一段对话"}]}
+        await client.post("/v1/chat/completions", json=same)
+        first = last_cred()
+        await client.post("/v1/chat/completions", json=same)
+        assert last_cred() == first
+
+        other = {"model": "glm-5.3-flash", "messages": [{"role": "user", "content": "另一段对话"}]}
+        await client.post("/v1/chat/completions", json=other)
+        assert last_cred() != first  # 另一段对话按轮询走下一个账号
+        affinity.reset()
 
     async def test_invalid_payload_rejected(self, gateway_client, fresh_app):
         client, _ = gateway_client

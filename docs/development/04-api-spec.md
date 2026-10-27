@@ -86,8 +86,9 @@
 
 | 方法/路径 | 说明 |
 |-----------|------|
-| `GET /admin/api/monitoring` | 内存环形请求日志（最新在前，KEEP=500，重启清零） |
-| `POST /admin/api/monitoring/clear` | 清空监控 |
+| `GET /admin/api/monitoring` | 实时视图：内存环形日志（最新在前，KEEP=500，含进行中，重启清零） |
+| `GET /admin/api/usage` | 持久台账：`range`（1h/6h/24h/today/7d/30d/all）× `outcome`（all/ok/fail/completed/client_aborted/upstream_aborted/failed）× `account` / `model` / `q` × `limit`(≤500) / `offset`。返回 `rows`（明细）+ `total` + `stats`（调用/成功率/token/缓存命中/首字/tok·s）+ `by_account` + `by_model` + `series`（按小时分桶） |
+| `POST /admin/api/monitoring/clear` | 清空实时环**与**持久台账（`data/usage.db`） |
 | `GET /admin/api/settings` | 不回明文密钥。返回 `admin_key_set` / `admin_key_masked` / `admin_key_is_default`、`gateway_key_set` / `gateway_key_masked`、`quota_refresh_interval`、`account_concurrency` |
 | `PUT /admin/api/settings` | 改密钥、刷新间隔、并发上限（改后即生效，落 meta 表；并发 0 = 不限）。前端回填的掩码（含 `…` 或 `••••`）忽略不覆盖；网关 key 传空字符串表示关闭校验 |
 

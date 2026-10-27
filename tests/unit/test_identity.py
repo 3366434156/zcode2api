@@ -54,10 +54,13 @@ class TestPassthroughFilter:
             "X-Zcode-Custom": "nope",
         })
         # 客户端注入的 stainless/自定义 zcode 头被剔除；本服务自生成 trace 头保留
-        assert "X-Stainless-Lang" not in headers
-        assert "x-stainless-runtime" not in headers
-        assert "X-Zcode-Custom" not in headers
-        assert "x-zcode-trace-id" in headers
+        lower = {k.lower() for k in headers}
+        assert "x-stainless-lang" not in lower
+        assert "x-stainless-runtime" not in lower
+        assert "x-zcode-custom" not in lower
+        # CLI 形态（默认）带 x-zcode-trace-id / x-zcode-session-type / x-query-id / x-session-id
+        for name in ("x-zcode-trace-id", "x-zcode-session-type", "x-query-id", "x-session-id"):
+            assert name in lower, name
 
     def test_benign_headers_pass_through(self):
         headers = self._build({"X-Custom-Trace": "keep-me"})
@@ -82,8 +85,12 @@ class TestPassthroughFilter:
 
     def test_identity_headers_not_overridable(self):
         headers = self._build({"X-Device-Mid": "spoofed", "User-Agent": "evil"})
-        assert headers["X-Device-Mid"] != "spoofed"
-        assert headers["User-Agent"] == constants.USER_AGENT
+        # CLI 形态上游不带 X-Device-Mid；客户端的值也绝不会透传
+        assert headers.get("X-Device-Mid") is None
+        lower = {k.lower(): v for k, v in headers.items()}
+        assert lower.get("x-device-mid") is None
+        assert headers["User-Agent"] != "evil"
+        assert headers["User-Agent"].startswith("ZCode/")
 
     def test_lowercase_client_hop_headers_dropped(self):
         """Starlette dict(request.headers) 键全小写。cookie/referer/origin 等
@@ -99,10 +106,17 @@ class TestPassthroughFilter:
             "x-original-forwarded-for": "203.0.113.9",
         })
         for name in (
-            "cookie", "referer", "origin", "accept", "accept-language",
+            "cookie", "referer", "origin",
             "true-client-ip", "x-original-forwarded-for",
-            "Cookie", "Referer", "Origin", "Accept", "Accept-Language",
+            "Cookie", "Referer", "Origin",
             "True-Client-Ip", "X-Original-Forwarded-For",
         ):
             assert name not in headers, name
+        # accept / accept-language 由本服务按 CLI 形态自生成，客户端的值不得透传
+        values = {str(v) for v in headers.values()}
+        assert "text/html" not in values
+        assert "fr-FR" not in values
+        lower = {k.lower(): v for k, v in headers.items()}
+        assert lower["accept"] == "*/*"
+        assert lower["accept-language"] == "*"
         assert headers["HTTP-Referer"] == constants.HTTP_REFERER

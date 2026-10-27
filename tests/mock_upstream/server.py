@@ -27,6 +27,7 @@ import json
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse
 
 SSE_EVENT = (
     'event: content_block_delta\ndata: {{"type":"content_block_delta",'
@@ -36,6 +37,21 @@ SSE_DONE = (
     'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}'
     ',"usage":{"output_tokens":5}}\n\n'
     'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+)
+# 思考块三件套：start / delta / stop（GLM 这类模型 reasoning 阶段的真实形态）
+SSE_THINKING_START = (
+    'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+    '"content_block":{"type":"thinking","thinking":"","signature":""}}\n\n'
+)
+SSE_THINKING_DELTA = (
+    'event: content_block_delta\ndata: {{"type":"content_block_delta","index":0,'
+    '"delta":{{"type":"thinking_delta","thinking":"{text}"}}}}\n\n'
+)
+SSE_THINKING_STOP = 'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+# 带缓存命中的 message_start：客户端「命中」一栏的数据源
+SSE_START_CACHED = (
+    'event: message_start\ndata: {"type":"message_start","message":{"role":"assistant",'
+    '"usage":{"input_tokens":10,"cache_read_input_tokens":1024}}}\n\n'
 )
 
 
@@ -181,9 +197,32 @@ def build_app() -> FastAPI:
                 headers={"x-mock-call-index": str(n), **extra_headers},
             )
 
+        # 业务错误场景：即使客户端要流式，上游也回整体 JSON（2026-10-27 实测形态：
+        # 「额度用尽」是 HTTP 200 + {"code":1005}，"并发已满" 是 429 + {"code":3009}）
+        if scenario.startswith("business_"):
+            return Response(
+                json.dumps(resp_body), status_code=status,
+                media_type="application/json",
+                headers={"x-mock-call-index": str(n), **extra_headers},
+            )
+
         if stream:
             chunks = int(headers.get("x-mock-sse-chunks", 3))
             truncate_at = headers.get("x-mock-sse-truncate-at")
+            # 测试协议：sse_thinking 打开时先发思考块（验证 reasoning_content 透传）；
+            # sse_gap 让事件之间停顿，给网关的心跳（SSE 注释帧）留出空闲窗口
+            if getattr(app.state, "sse_thinking", False):
+                return StreamingResponse(
+                    _sse_thinking_stream(), status_code=200, media_type="text/event-stream",
+                    headers={"x-mock-call-index": str(n), "cache-control": "no-cache"},
+                )
+            gap = float(getattr(app.state, "sse_gap", 0) or 0)
+            if gap:
+                return StreamingResponse(
+                    _sse_gapped_stream(chunks, gap), status_code=200,
+                    media_type="text/event-stream",
+                    headers={"x-mock-call-index": str(n), "cache-control": "no-cache"},
+                )
             content = _sse_stream(chunks)
             if scenario == "sse_truncate" and truncate_at is not None:
                 cut = int(truncate_at)
@@ -238,6 +277,12 @@ def build_app() -> FastAPI:
             return 404, _error_body("no such route", type="invalid_request_error"), {}
         if scenario == "garbage_body":
             return 200, "<html>not json</html>", {}
+        # 上游业务错误：HTTP 200 + body 里的 code（zcode-plan 的真实形态）
+        if scenario == "business_quota_200":
+            return 200, {"code": 1005, "msg": "exceed quota limit", "logid": "mock"}, {}
+        # 模型并发已满：429 + code 3009（换号即可，不该原地等 60s）
+        if scenario == "business_concurrency_429":
+            return 429, {"code": 3009, "msg": "model concurrency limit exceeded"}, {}
         return 200, ok_body, {}
 
     def _sse_stream(chunks: int) -> str:
@@ -248,6 +293,31 @@ def build_app() -> FastAPI:
             parts.append(SSE_EVENT.format(text=f"chunk-{i}"))
         parts.append(SSE_DONE)
         return "".join(parts)
+
+    async def _sse_thinking_stream():
+        """思考块（两条 thinking_delta）→ 文本块 → 结束，附缓存命中数。"""
+        for part in (
+            SSE_START_CACHED,
+            SSE_THINKING_START,
+            SSE_THINKING_DELTA.format(text="想"),
+            SSE_THINKING_DELTA.format(text="一想"),
+            SSE_THINKING_STOP,
+            SSE_EVENT.format(text="chunk-0"),
+            SSE_DONE,
+        ):
+            yield part
+
+    async def _sse_gapped_stream(chunks: int, gap: float):
+        """每个事件之间停 gap 秒：网关应当在此期间补 SSE 注释帧。"""
+        parts = [
+            'event: message_start\ndata: {"type":"message_start","message":{"role":"assistant"}}\n\n'
+        ]
+        for i in range(chunks):
+            parts.append(SSE_EVENT.format(text=f"chunk-{i}"))
+        parts.append(SSE_DONE)
+        for part in parts:
+            yield part
+            await asyncio.sleep(gap)
 
     async def _billing_current(request: Request) -> Response:
         headers = {k.lower(): v for k, v in request.headers.items()}

@@ -39,6 +39,13 @@ _STORE_BINDING_MODULES = (
     "app.auth_admin",
 )
 
+# 绑定了请求台账单例（usagelog）的模块 —— 同上，新增导入点必须同步
+_USAGE_BINDING_MODULES = (
+    "app.usagelog",
+    "app.reqlog",
+    "app.routes.admin_api",
+)
+
 
 @pytest.fixture(scope="session")
 def mock_server():
@@ -70,6 +77,7 @@ def fresh_app(tmp_path, monkeypatch):
     monkeypatch.setenv("ZCODE_DATA_DIR", str(data_dir))
     monkeypatch.setattr(settings, "DATA_DIR", data_dir)
     monkeypatch.setattr(settings, "DB_PATH", data_dir / "accounts.db")
+    monkeypatch.setattr(settings, "USAGE_DB_PATH", data_dir / "usage.db")
     monkeypatch.setattr(settings, "COOLING_SECONDS", 300)
 
     from app import store as store_module
@@ -84,7 +92,18 @@ def fresh_app(tmp_path, monkeypatch):
     from app import auth_admin as auth_admin_module
     if hasattr(auth_admin_module, "reset_failures"):
         auth_admin_module.reset_failures()
-    return fresh
+
+    # 请求台账同样是模块级单例（导入时就绑定了真实 data/usage.db）：
+    # 换到临时文件，否则测试会把记录写进用户真实台账
+    from app import usagelog as usagelog_module
+    fresh_usage = usagelog_module.UsageLog(data_dir / "usage.db")
+    for mod_name in _USAGE_BINDING_MODULES:
+        mod = importlib.import_module(mod_name)
+        if hasattr(mod, "usagelog"):
+            monkeypatch.setattr(mod, "usagelog", fresh_usage)
+    yield fresh
+    fresh_usage.close()
+    return
 
 
 class _StubCaptcha:
