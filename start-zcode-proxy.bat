@@ -15,6 +15,11 @@ rem
 rem  NOTE: this script puts no %VAR% inside an if( ... ) block,
 rem  because a path containing ( or ) breaks the cmd.exe parser.
 rem  All checks use if/errorlevel/goto instead.
+rem
+rem  Nothing to configure here: app/settings.py auto-detects the
+rem  captcha browser per platform (Edge first on Windows), and the
+rem  admin key is written to the DB on first run (default "zcode";
+rem  change it under Settings after logging in).
 rem ===========================================================
 
 set "PORT=%~1"
@@ -36,9 +41,6 @@ if errorlevel 1 goto no_python
 set "PYEXE=python"
 
 :have_py
-rem ---- 浏览器与后台密码都不用在这里设：
-rem      app/settings.py 会自动按平台探测 Chrome/Edge（Windows 优先 Edge），
-rem      后台密码首次启动写库（默认 zcode，登录后在「设置」里改）。
 echo ===========================================================
 echo   zcode-hub - ZCode to Anthropic / OpenAI gateway
 echo.
