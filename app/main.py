@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from contextlib import asynccontextmanager
 
@@ -13,7 +14,7 @@ from . import logs, settings
 from .captcha import captcha_manager
 from .claim import claim_round
 from .quota import monitor
-from .routes import admin_api, gateway, pages
+from .routes import admin_api, admin_logs, gateway, pages
 
 # 修正 Windows 中文控制台可能出现的乱码
 for _stream in (sys.stdout, sys.stderr):
@@ -21,6 +22,38 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001
         pass
+
+
+class _LogstoreHandler(logging.Handler):
+    """把 uvicorn 的 access / error 日志接进网关日志台账。
+
+    uvicorn 走标准 logging，不经过 app.logs：不接的话「谁在什么时候打了什么
+    请求、进程最后一条输出是什么」就只剩 launcher 窗口里有，窗口一关全丢。
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            from .logstore import logstore
+
+            tag = "access" if record.name == "uvicorn.access" else "uvicorn"
+            level = ("INFO" if record.levelno < logging.WARNING
+                     else "WARN" if record.levelno < logging.ERROR else "ERROR")
+            logstore.write(level, tag, record.getMessage(),
+                           req_id=str(getattr(record, "req_id", "") or ""))
+        except Exception:  # noqa: BLE001 - 日志旁路失败不影响服务
+            pass
+
+
+def _attach_uvicorn_logging() -> None:
+    handler = _LogstoreHandler()
+    # 只挂 uvicorn 与 uvicorn.access：uvicorn.error 会冒泡到 uvicorn（不另挂，
+    # 否则同一条记录父子各记一次，日志文件里全是重复行）。uvicorn 默认把
+    # access 的 propagate 关了，所以它必须单独挂。
+    for name in ("uvicorn", "uvicorn.access"):
+        logger = logging.getLogger(name)
+        # 只挂一次：create_app 可能被测试反复调用
+        if not any(isinstance(h, _LogstoreHandler) for h in logger.handlers):
+            logger.addHandler(handler)
 
 
 def _display_host() -> str:
@@ -130,12 +163,16 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    _attach_uvicorn_logging()
     app = FastAPI(title="zcode-hub", version=settings.APP_VERSION, lifespan=lifespan)
 
     app.mount("/static", StaticFiles(directory=str(settings.FRONTEND_DIR)), name="static")
 
     app.include_router(pages.router)
     app.include_router(admin_api.router)
+    # 网关日志单独一个 router：它的数据源（logstore）与请求台账完全独立，
+    # 拆开可以让「日志」随时增删而不碰 admin_api 这个已经很大的文件
+    app.include_router(admin_logs.router, prefix="/admin/api")
     app.include_router(gateway.router)
     return app
 

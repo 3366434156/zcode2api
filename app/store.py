@@ -31,6 +31,11 @@ class Store:
         self._accounts: dict[str, list[Account]] = {p: [] for p in PROVIDERS}
         self._settings: dict = {}
         self._rotation: dict[str, int] = {p: 0 for p in PROVIDERS}
+        # 全局粘号：provider -> (账号 id, 记住的时刻)。只放内存：重启后第一次
+        # 请求重新学一遍的代价，远小于把「上次用谁」持久化带来的状态一致性负担。
+        self._sticky_id: dict[str, str] = {}
+        self._sticky_at: dict[str, float] = {}
+        self._sticky_ttl = settings.AFFINITY_TTL
         self._init_db()
         self._load()
 
@@ -97,6 +102,10 @@ class Store:
                 f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('model_fallback_ttl', ?)",
                 (str(settings.MODEL_FALLBACK_TTL),),
             )
+            conn.execute(
+                f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('account_sticky', ?)",
+                ("1" if settings.ACCOUNT_STICKY else "0",),
+            )
             conn.commit()
 
     def _load(self) -> None:
@@ -113,6 +122,8 @@ class Store:
             self._settings.setdefault("model_fallback_chain",
                                       ",".join(settings.MODEL_FALLBACK_CHAIN))
             self._settings.setdefault("model_fallback_ttl", str(settings.MODEL_FALLBACK_TTL))
+            self._settings.setdefault("account_sticky",
+                                      "1" if settings.ACCOUNT_STICKY else "0")
 
             self._accounts = {p: [] for p in PROVIDERS}
             rows = conn.execute(
@@ -310,6 +321,46 @@ class Store:
                 account.cooling_until = None
             self._persist_account(account)
             return True
+
+    # ── 全局粘号（「正常情况下就一直用一个账号」）───────────────────────────────
+    def sticky_account(self, provider: str) -> str:
+        """上次成功服务的账号 id（全局粘号，未过期才算）。
+
+        与会话粘性（affinity）的分工：affinity 管「同一段对话回同一个号」（上游
+        前缀缓存命中），全局粘号管「所有流量都尽量待在一个号上」——不认识的会话
+        也先回到上次那个号，而不是轮询把流量摊开。返回 "" 表示没有记住的。
+        """
+        with self._lock:
+            at = self._sticky_at.get(provider, 0.0)
+            if not at or time.time() - at > self._sticky_ttl:
+                return ""
+            return self._sticky_id.get(provider, "")
+
+    def set_sticky_account(self, provider: str, account_id: str) -> None:
+        """成功拿到 200 之后调用：把全局粘号指向这个账号。"""
+        with self._lock:
+            if not account_id:
+                return
+            self._sticky_id[provider] = account_id
+            self._sticky_at[provider] = time.time()
+
+    def clear_sticky_account(self, provider: str | None = None) -> None:
+        """测试夹具 / 后台「重新粘号」用。"""
+        with self._lock:
+            if provider is None:
+                self._sticky_id.clear()
+                self._sticky_at.clear()
+            else:
+                self._sticky_id.pop(provider, None)
+                self._sticky_at.pop(provider, None)
+
+    def account_sticky_enabled(self) -> bool:
+        """全局粘号开关（运行时可改，meta 表）。"""
+        raw = str(self.get_setting(
+            "account_sticky",
+            "1" if settings.ACCOUNT_STICKY else "0",
+        )).strip().lower()
+        return raw in ("1", "true", "yes", "on")
 
     # ── 轮询选择 ─────────────────────────────────────────────────────────────
     def count_selectable(self, provider: str, now: float | None = None) -> int:

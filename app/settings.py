@@ -63,6 +63,9 @@ FRONTEND_DIR = _resolve_path(
     "ZCODE_FRONTEND_DIR",
     "frontend" if (ROOT_DIR / "frontend").is_dir() else str(Path(__file__).resolve().parent / "statics"),
 )
+# 网关运行日志落盘保留天数（data/logs/gateway-YYYYMMDD.jsonl；0 = 永不清理）。
+# 落盘是为了「进程死后还能查案」：自动关闭、上游异常、被谁打了请求，都在文件里。
+LOG_RETENTION_DAYS = _int("ZCODE_LOG_RETENTION_DAYS", 14)
 
 # ── 服务 ─────────────────────────────────────────────────────────────────────
 PORT = _int("ZCODE_PORT", 3000)
@@ -166,6 +169,11 @@ RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
 # 跳号（不排队、不惊动上游），并发能力因此等于账号数（4 个号 = 4 路）。
 # 运行期可在后台设置改（meta 表即时生效）
 ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 1)
+# 全局粘号：所有会话的流量都尽量留在同一个账号上（默认开）。只有它不可用
+# （额度用完 / 冷却 / 并发满 / 凭证失效）才轮询下一个——上游按「账号 × 模型」
+# 计并发租约，摊开到多个号并不能提高并发上限，只会让后台看起来一直在跳号。
+# 会话粘性（affinity）仍然优先：同一段对话先回它上次用的号。
+ACCOUNT_STICKY = _bool("ZCODE_ACCOUNT_STICKY", True)
 # 模型级并发（上游 429 + code 3009「model concurrency limit exceeded」）：实测
 # **上一个请求刚结束的 1–2 秒内**再发，所有账号都会回 3009——那是上游按模型计的
 # 并发租约还没释放，不是账号坏了。整轮只因为这个原因失败时，短等再来而不是直接
@@ -234,7 +242,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.0"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 
@@ -249,3 +257,4 @@ def frontend_version() -> str:
         return v or APP_VERSION
     except OSError:
         return APP_VERSION
+

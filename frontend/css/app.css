@@ -1,16 +1,23 @@
-/* zcode-hub — Design System（视觉语言参考 zcode-switch：暗色 · 琥珀 · hairline） */
+/* zcode-hub — Design System（视觉语言参考 zcode-switch：暗色 · 琥珀 · hairline）
+   字体栈对齐 workbuddy 用量看板：正文系统 sans（无 CDN 依赖，离线/内网可用），
+   标题用衬线（中文回退思源宋体/宋体），数字与日志用等宽 + tabular-nums。 */
 :root {
   --bg:#16171b; --bg-2:#1b1d22; --panel:#1f2127; --panel-2:#23252c;
   --hairline:#2c2f37; --hairline-soft:#26282f;
   --ink:#e9e7e1; --ink-dim:#b3b6bf; --ink-mute:#838794;
   --amber:#e8a33d; --amber-deep:#c9862a; --amber-ink:#241a09;
   --mint:#62c370; --mint-dim:#3d8a4a; --red:#e05252; --red-dim:#8f3434;
-  --mono:"SF Mono","Cascadia Code",Consolas,ui-monospace,monospace;
-  --font-sans:"Geist Sans",-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Cascadia Code",monospace;
+  --font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue","PingFang SC","Microsoft YaHei",sans-serif;
+  --font-serif:ui-serif,Georgia,"Source Han Serif SC","Noto Serif SC","Songti SC",serif;
   --radius:8px; --radius-xl:14px;
   --shadow-md:0 4px 16px rgba(0,0,0,.4); --shadow-lg:0 20px 50px rgba(0,0,0,.5);
   --notch-1:#e8a33d; --notch-2:#6da8e8; --notch-3:#b78ae0;
   --notch-4:#e07b9a; --notch-5:#6dc8b8; --notch-6:#c9b458;
+  /* 终端视窗配色（网关日志页）：取自 workbuddy 看板的 #pageLogs */
+  --terminal-bg:#16140f; --terminal-head:#1d1b15; --terminal-border:#2b2820;
+  --terminal-fg:#d6d3c9; --terminal-dim:#7c796f;
+  --terminal-error:#ef4444; --terminal-warn:#f59e0b; --terminal-ok:#10b981;
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:var(--font-sans);background:linear-gradient(180deg,var(--bg-2) 0%,var(--bg) 220px);color:var(--ink);line-height:1.6;-webkit-font-smoothing:antialiased;min-height:100vh}
@@ -83,7 +90,8 @@ select.input option{background:var(--panel);color:var(--ink)}
 
 /* Page heading */
 .page-hd{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:22px;gap:12px;flex-wrap:wrap}
-.page-title{font-size:22px;font-weight:700;line-height:1.2}
+/* 页面大标题：衬线 + 字距（对齐 workbuddy 看板的标题排版语言） */
+.page-title{font-family:var(--font-serif);font-size:22px;font-weight:600;line-height:1.25;letter-spacing:.01em}
 .page-sub{font-size:13px;color:var(--ink-mute);margin-top:5px}
 .page-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .page-action-btn{height:34px;padding:0 14px;border-radius:8px;display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;border:1px solid var(--hairline);background:var(--panel);color:var(--ink-dim);transition:background .15s,border-color .15s,color .15s}
@@ -94,7 +102,7 @@ select.input option{background:var(--panel);color:var(--ink)}
 
 /* Section */
 .section-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:28px 0 14px}
-.section-title{font-size:13px;font-weight:600;color:var(--ink);display:inline-flex;align-items:center;gap:8px}
+.section-title{font-family:var(--font-serif);font-size:14px;font-weight:600;color:var(--ink);letter-spacing:.02em;display:inline-flex;align-items:center;gap:8px}
 .section-count-badge{min-width:20px;height:20px;padding:0 7px;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;background:var(--panel);border:1px solid var(--hairline);color:var(--ink-mute);font-family:var(--mono);font-size:11px;font-weight:600}
 .section-meta{font-size:12px;color:var(--ink-mute)}
 
@@ -125,7 +133,8 @@ select.input option{background:var(--panel);color:var(--ink)}
 .stat-icon{width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;color:var(--ink-mute);transition:color .18s ease,transform .18s ease}
 .stat-icon svg{width:15px;height:15px;stroke:currentColor;fill:none}
 .stat-cell:hover .stat-icon{color:var(--amber);transform:scale(1.06)}
-.stat-num{font-family:var(--mono);font-size:22px;font-weight:600;line-height:1;letter-spacing:-.02em;margin-top:auto}
+/* KPI 大数字：等宽 + tabular-nums，多位数跳动时不抖宽度（对齐 workbuddy 看板） */
+.stat-num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:22px;font-weight:600;line-height:1;letter-spacing:-.02em;margin-top:auto}
 
 /* ── 账号池列表（CPA-Manager-Plus 风格 6 列表格：凭证/状态/最近请求/用量/额度/操作）── */
 .acct-scroll{overflow-x:auto}
@@ -343,6 +352,8 @@ select.input option{background:var(--panel);color:var(--ink)}
 /* 换模型：客户端点的模型与实际服务的模型不同（模型兜底自动切换）。
    用暖色而非蓝色，和「流式」这种协议形态标记区分开——它是「发生过一次切换」的事实。 */
 .mon-swap{display:inline-block;margin-left:4px;padding:0 5px;border-radius:4px;font-size:10px;background:rgba(232,163,61,.16);color:var(--amber);font-weight:600;white-space:nowrap;vertical-align:middle;cursor:help}
+/* 换号：中途换过账号（账号维度的事实），与「换模型」（模型维度）用不同色区分 */
+.mon-switch{background:rgba(109,168,232,.14);color:#6da8e8}
 .mon-muted{color:var(--ink-mute);font-weight:400}
 .tier-b.jwt{background:rgba(109,200,184,.16);color:#6dc8b8}
 

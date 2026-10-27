@@ -48,6 +48,7 @@ def begin(req_id: str, endpoint: str, model: str, stream: bool, preview: str = "
         "account": "",
         "account_id": "",
         "mode": "",
+        "switches": [],      # 换号轨迹：[{from,to,why}]，每次换号追加一条
         "ok": None,
         "outcome": None,
         "status": None,
@@ -78,6 +79,28 @@ def mark_account(req_id: str, account_name: str, mode: str, account_id: str = ""
             entry["mode"] = mode
             if account_id:
                 entry["account_id"] = account_id
+
+
+def mark_switch(req_id: str, from_account: str, to_account: str, why: str) -> None:
+    """记录一次换号：从谁换成谁、为什么。
+
+    「老是跳号」是否正常、跳得值不值，只有看到**原因**才能判断——额度用完的
+    换号是该换，风控/并发的换号是必要的，轮询摊开的换号才值得警惕。同一个
+    请求里可能换多次（额度→换号→又冷却→再换号），所以是列表不是单值。
+    """
+    if not why:
+        return
+    with _lock:
+        entry = _inflight.get(req_id)
+        if entry is None:
+            return
+        switches = entry.setdefault("switches", [])
+        if len(switches) < 8:   # 防御：异常风暴下不要把一行日志撑成几百字
+            switches.append({
+                "from": (from_account or "")[:40],
+                "to": (to_account or "")[:40],
+                "why": str(why)[:120],
+            })
 
 
 def mark_model(req_id: str, model: str) -> None:
@@ -198,6 +221,7 @@ def _row(entry: dict) -> dict:
         "account": entry["account"],
         "account_id": entry["account_id"],
         "mode": entry["mode"],
+        "switches": entry.get("switches") or [],
         "model": entry["model"],
         "requested_model": entry["requested_model"],
         "stream": entry["stream"],

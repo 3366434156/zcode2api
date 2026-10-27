@@ -307,9 +307,19 @@ class TestChatCompletions:
         await client.post("/v1/chat/completions", json=same)
         assert last_cred() == first
 
+        # 全局粘号（默认开）：新对话也先回到上次成功服务的账号，而不是轮询摊开
+        # ——上游按「账号 × 模型」计并发租约，摊开换不来更高并发，只会看起来跳号。
         other = {"model": "glm-5.3-flash", "messages": [{"role": "user", "content": "另一段对话"}]}
         await client.post("/v1/chat/completions", json=other)
-        assert last_cred() != first  # 另一段对话按轮询走下一个账号
+        assert last_cred() == first
+
+        # 关掉全局粘号才回到老的轮询语义：清掉会话粘性后，新对话换下一个账号
+        affinity.reset()
+        fresh_app.set_setting("account_sticky", "0")
+        third = {"model": "glm-5.3-flash", "messages": [{"role": "user", "content": "第三段对话"}]}
+        await client.post("/v1/chat/completions", json=third)
+        assert last_cred() != first
+        fresh_app.set_setting("account_sticky", "1")
         affinity.reset()
 
     async def test_invalid_payload_rejected(self, gateway_client, fresh_app):

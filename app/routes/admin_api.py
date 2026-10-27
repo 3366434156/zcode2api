@@ -726,6 +726,8 @@ async def get_settings():
         "quota_refresh_interval": store.quota_refresh_interval(),
         "account_concurrency": store.account_concurrency(),
         "claim_round_interval": store.claim_round_interval(),
+        # 全局粘号：所有会话的流量都尽量留在同一个账号（只有它不可用才轮询）
+        "account_sticky": store.account_sticky_enabled(),
         # 回填「归一化后」的链：modelpool.chain 会把小写别名映射成上游官方名、
         # 去重、去空。若原样回填用户写的 "glm-5.3"，输入框里看到的名字和网关
         # 实际请求的 "GLM-5.3" 不一致，改完保存还以为没生效。
@@ -793,6 +795,11 @@ async def update_settings(payload: dict = Body(...)):
         if ttl < 0:
             raise HTTPException(400, "模型兜底冷却必须是非负整数")
         store.set_setting("model_fallback_ttl", str(ttl))
+    if payload.get("account_sticky") is not None:
+        # 与模型兜底开关同一口径：bool 或 "0"/"1"，null 视为没提这个字段
+        raw = payload["account_sticky"]
+        enabled = raw if isinstance(raw, bool) else str(raw).strip().lower() in ("1", "true", "yes", "on")
+        store.set_setting("account_sticky", "1" if enabled else "0")
     return {"ok": True}
 
 

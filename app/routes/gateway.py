@@ -422,6 +422,13 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
                              headers={"Cache-Control": "no-cache", **_model_headers(up)})
 
 
+def _sticky_prefer(provider: str) -> str:
+    """全局粘号候选（未开或没有记住时返回 ""，调用方自然落回轮询）。"""
+    if not store.account_sticky_enabled():
+        return ""
+    return store.sticky_account(provider) or ""
+
+
 async def _dispatch(req_id, body, incoming_headers, port, provider, conv_key: str = "",
                     no_fallback: bool = False):
     """调度：先按模型兜底链逐模型试，每个模型内部再多账号轮询。
@@ -450,7 +457,10 @@ async def _dispatch(req_id, body, incoming_headers, port, provider, conv_key: st
     models = [requested] if no_fallback else modelpool.candidates(provider, requested)
     if not models:
         models = [requested]
-    prefer = affinity.prefer(provider, conv_key)
+    # 选号优先级：会话粘性（这段对话上次谁答的，上游前缀缓存能命中）>
+    # 全局粘号（上次成功服务的是谁，所有流量尽量待在一个号上）> 轮询。
+    # 粘号候选不可用时 store.select 会自然落到轮询，这里只负责给出"想让谁上"。
+    prefer = affinity.prefer(provider, conv_key) or _sticky_prefer(provider)
     # 换号原因的出口：最后一个账号为什么不可用（模型额度用尽等），503 时如实回给客户端
     reason: list[str] = [""]
     dead_models: list[str] = []
@@ -509,6 +519,11 @@ async def _dispatch_model(req_id, body, incoming_headers, port, provider, prefer
     `_MODEL_DEAD`（整轮每个账号都是「这个模型不可用」）/ None（失败但非模型问题）。
     """
     limit = _limit()
+    # 换号轨迹的记账本：上一个真正尝试过的账号 + 它为什么被放弃。
+    # 记在调度层而不是每个错误分支里，才能保证「从谁换成谁、为什么」必然成对出现
+    #（错误分支有 19 处，逐处记漏一处轨迹就断链）。
+    prev_name = ""
+    prev_why = ""
 
     for round_no in range(settings.MODEL_BUSY_ROUNDS + 1):
         tried: set[str] = set()
@@ -530,6 +545,12 @@ async def _dispatch_model(req_id, body, incoming_headers, port, provider, prefer
                 logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
                 skipped_busy += 1
                 continue
+            if prev_name and prev_name != account.name:
+                # 前一个账号被放弃、换这一个：把原因记进请求轨迹（面板悬停可查）。
+                reqlog.mark_switch(req_id, prev_name, account.name,
+                                   prev_why or reason[0] or "上一账号不可用")
+            prev_name = account.name
+            prev_why = ""
             attempts += 1
             needs_captcha = provider == "zai" and account.uses_plan_channel()
 
@@ -547,6 +568,7 @@ async def _dispatch_model(req_id, body, incoming_headers, port, provider, prefer
                     _release_slot(slot_box[0])
                     slot_box[0] = None
                 raise
+            prev_why = reason[0]
             if result is _NEXT_BUSY:
                 busy_hits += 1
             elif result is _NEXT_MODEL:
@@ -558,6 +580,11 @@ async def _dispatch_model(req_id, body, incoming_headers, port, provider, prefer
                 continue
             if isinstance(result, _Upstream):
                 affinity.remember(provider, conv_key, account.id)
+                # 全局粘号：这次成功证明了「这个号现在能用」，把全局粘号钉到它上面，
+                # 后续别的会话也优先用它——而不是轮询把流量摊开（上游按账号 × 模型
+                # 计并发租约，摊开换不来更高并发，只会看起来一直在跳号）。
+                if store.account_sticky_enabled():
+                    store.set_sticky_account(provider, account.id)
                 held = slot_box[0]
                 slot_box[0] = None
                 if held is not None:
@@ -862,6 +889,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 )
             if not _reacquire_slot(account, slot_box):
                 logs.warn(req_id, f"账号 {account.name} 验证码等待后并发已满，切换下一个")
+                if reason is not None:
+                    reason[0] = "验证码等待后本账号并发已满"
                 return _NEXT_ACCOUNT
 
         try:
@@ -871,6 +900,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         except RuntimeError as err:
             account.record_result(False, f"凭证无效: {err}")
             _mark(account, Status.INVALID, str(err))
+            if reason is not None:
+                reason[0] = f"凭证无效（{str(err)[:60]}）"
             logs.warn(req_id, f"账号 {account.name} 凭证无效，切换下一个")
             return _NEXT_ACCOUNT
 
@@ -887,6 +918,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             else:
                 _mark(account, Status.COOLING, f"连接失败: {err}")
             logs.warn(req_id, f"账号 {account.name} 连接失败，切换下一个")
+            if reason is not None:
+                reason[0] = f"连接失败（{str(err)[:60]}）"
             return _NEXT_ACCOUNT
 
         status_code = resp.status_code
@@ -927,8 +960,11 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     f"（上游 {business_code or status_code}），换下一个账号",
                 )
                 if reason is not None:
+                    # 不带「换号后仍无可用」的尾巴：这条 reason 只描述**这个账号**
+                    # 为什么被放弃，换成谁、最终成没成是调度层自己的事（每次换号
+                    # 的轨迹由 mark_switch 单独记录）
                     reason[0] = (f"{model_name} 并发已满"
-                                 f"（上游 code {business_code or status_code} · 换号后仍无可用）")
+                                 f"（上游 code {business_code or status_code}）")
                 # 并发已满 ≠ 账号不可用：交给 _dispatch 决定「短等重试整轮」还是收口
                 return _NEXT_BUSY
 
@@ -955,6 +991,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 if captcha_retries >= MAX_CAPTCHA_RETRIES:
                     account.record_result(False, "验证码挑战连续失败")
                     logs.warn(req_id, f"账号 {account.name} 验证码连续失败，切换下一个")
+                    if reason is not None:
+                        reason[0] = "验证码挑战连续失败"
                     return _NEXT_ACCOUNT
                 logs.warn(req_id, f"账号 {account.name} 验证码挑战（{challenge}），刷新重试")
                 continue  # 同账号重建请求重试
@@ -1012,6 +1050,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     req_id,
                     f"账号 {account.name} 命中风控 HTTP {status_code}，{penalty_note}，切换下一个",
                 )
+                if reason is not None:
+                    reason[0] = f"风控 HTTP {status_code}（{penalty_note}）"
                 return _NEXT_ACCOUNT
 
             if _is_exhausted(status_code, text):
@@ -1022,6 +1062,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     _mark(account, Status.EXHAUSTED, "额度已用完")
                     _spawn_bg(_safe_refresh(account))
                 logs.warn(req_id, f"账号 {account.name} 额度用完，切换下一个")
+                if reason is not None:
+                    reason[0] = "账号额度用完"
                 return _NEXT_ACCOUNT
 
             if status_code == 401:
@@ -1033,6 +1075,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     force_fallback = True
                     continue
                 logs.warn(req_id, f"账号 {account.name} 鉴权失败 401，切换下一个")
+                if reason is not None:
+                    reason[0] = "鉴权失败 HTTP 401"
                 return _NEXT_ACCOUNT
 
             if status_code == 403:
@@ -1045,6 +1089,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     force_fallback = True
                     continue
                 logs.warn(req_id, f"账号 {account.name} 鉴权失败 403，切换下一个")
+                if reason is not None:
+                    reason[0] = "鉴权拒绝 HTTP 403"
                 return _NEXT_ACCOUNT
 
             if status_code == 429:
@@ -1075,6 +1121,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     await _sleep(wait)
                     if not _reacquire_slot(account, slot_box):
                         logs.warn(req_id, f"账号 {account.name} 429 等待后并发已满，切换下一个")
+                        if reason is not None:
+                            reason[0] = "限流等待后本账号并发已满"
                         return _NEXT_ACCOUNT
                     continue
                 if needs_captcha and account.has_apikey_fallback():
@@ -1091,6 +1139,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     f"账号 {account.name} 429 重试 {settings.RETRY_429_TIMES} 次耗尽，"
                     f"切换下一个（账号保持可用）",
                 )
+                if reason is not None:
+                    reason[0] = f"限流 429 重试 {settings.RETRY_429_TIMES} 次耗尽"
                 return _NEXT_ACCOUNT
 
             if status_code >= 500:
@@ -1106,6 +1156,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     await _sleep(settings.RETRY_5XX_WAIT)
                     if not _reacquire_slot(account, slot_box):
                         logs.warn(req_id, f"账号 {account.name} 5xx 等待后并发已满，切换下一个")
+                        if reason is not None:
+                            reason[0] = "上游 5xx 等待后本账号并发已满"
                         return _NEXT_ACCOUNT
                     continue
                 account.record_result(False, f"HTTP {status_code} 重试 {settings.RETRY_5XX_TIMES} 次耗尽，冷却")
@@ -1121,6 +1173,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     account.last_error = f"上游 HTTP {status_code} 重试 {settings.RETRY_5XX_TIMES} 次耗尽，冷却"
                     store.update_account(account)
                     logs.warn(req_id, f"账号 {account.name} 上游 {status_code} 重试耗尽，冷却 {cool}s，切换下一个")
+                if reason is not None:
+                    reason[0] = f"上游 HTTP {status_code} 重试 {settings.RETRY_5XX_TIMES} 次耗尽"
                 return _NEXT_ACCOUNT
 
             # 其它 4xx：直接回传客户端；响应体全量落日志供排查

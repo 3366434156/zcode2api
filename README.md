@@ -131,6 +131,68 @@ allow-firewall.bat remove   :: 撤销这两条规则
 > ⚠️ 后台默认口令是 `zcode`，**放行前先改掉**（设置 → 后台密码）。`/v1/*` 另有网关 API Key
 > 单独把关（设置 → 网关 API Key），两者不要用同一个值。
 
+## 公网访问（换个网络也能用）
+
+网关没有「只允许局域网」的代码限制：进程监听 `0.0.0.0:3000`，**只要网络层能路由到这个端口就能用**。
+真正要解决的是三件事——可达性（家用宽带多为 NAT / CGNAT，外网连不进来）、TLS（裸 HTTP 会把 API Key
+和后台口令明文暴露）、鉴权（`/admin` 是整台机器的控制面）。
+
+### 方案 A：Cloudflare Tunnel（推荐，无需公网 IP，穿透 NAT）
+
+临时试用，跑起来会打印一个 `https://xxx.trycloudflare.com` 地址，关掉即失效：
+
+```bat
+set ZCODE_HOST=127.0.0.1
+cloudflared tunnel --url http://127.0.0.1:3000
+```
+
+固定域名（需要自己的域名托管在 Cloudflare）：
+
+```bat
+cloudflared tunnel login
+cloudflared tunnel create zcode
+cloudflared tunnel route dns zcode gw.example.com
+cloudflared service install        :: 注册成 Windows 服务，开机自启
+```
+
+`%USERPROFILE%\.cloudflared\config.yml` 写入口规则（`<TUNNEL_ID>` 用 create 时打印的那个）：
+
+```yaml
+tunnel: <TUNNEL_ID>
+credentials-file: C:\Users\<你>\.cloudflared\<TUNNEL_ID>.json
+ingress:
+  - hostname: gw.example.com
+    service: http://127.0.0.1:3000
+  - service: http_status:404
+```
+
+- 隧道是**本机出站**连接，所以可以把 `ZCODE_HOST` 设成 `127.0.0.1`，再 `allow-firewall.bat remove`
+  撤掉入站放行——3000 端口不再对局域网/公网敞开，只有隧道进得来。
+- cloudflared 会注入 `CF-Connecting-IP`，`app/auth_admin.py` 优先读它，按 IP 的登录失败锁定照常生效。
+- 想再收紧后台：Cloudflare Zero Trust → Access 里给 `gw.example.com/admin*` 加一条策略（邮箱 OTP / Google 登录），
+  公网就打不开后台，`/v1/*` 仍可凭网关 Key 直连。
+
+### 方案 B：Tailscale（只给自己的设备）
+
+装 Tailscale 并登录，本机拿到 `100.x.y.z`；其它设备加入同一 tailnet 后直接访问
+`http://100.x.y.z:3000/admin`。不对公网暴露任何端口，源 IP 仍是真实设备 IP，限流照常按 IP 生效。
+
+### 方案 C：公网 IP + 端口映射 / VPS 反代
+
+- 有公网 IPv4：路由器把 3000 映射到本机，**务必**再套一层 HTTPS（Caddy 自动证书最省事）。
+- CGNAT（联通/移动宽带常见）拿不到公网 IP：用 VPS 跑 `frp` / `nps` 做反向代理。
+
+> 反代只在 `X-Forwarded-For` 里写来源 IP 时，`auth_admin.py` 认不出真实客户端，所有请求都会算成反代那一个
+> IP——一个人连续输错 8 次会把**所有人**（包括你自己）锁 5 分钟。nginx 补一行
+> `proxy_set_header X-Real-IP $remote_addr;`，Caddy 用 `header_up X-Real-IP {remote_host}`。
+
+### 暴露前的检查清单
+
+1. **改掉后台口令**：默认 `zcode`，而 `/admin` 能改账号池、网关 Key 和全部设置，等于交出整台机器的控制权。
+2. **网关 API Key 不能留空**：留空时 `verify_gateway_key` 直接放行，等于把上游额度免费开放给扫端口的任何人。
+3. `ZCODE_HOST`：走隧道或本机反代时设 `127.0.0.1`；只有要直连局域网时才用 `0.0.0.0`。
+4. 网关转发上游前会剔除 `x-forwarded-*` / `cf-*` 等中间件头（见 `app/agent.py`），不会把部署拓扑带出去。
+
 ## 多账号轮询与故障转移
 
 - 在账号池粘贴 Coding Plan JWT（3 段点分）或 API Key，每行一个即可加入轮询。

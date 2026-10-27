@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import json
 import queue
 import sqlite3
 import threading
@@ -55,7 +56,8 @@ CREATE TABLE IF NOT EXISTS requests (
     cache_hit_pct REAL,
     usage_missing INTEGER NOT NULL DEFAULT 0,
     preview       TEXT    NOT NULL DEFAULT '',
-    client        TEXT    NOT NULL DEFAULT ''
+    client        TEXT    NOT NULL DEFAULT '',
+    switches      TEXT    NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_req_ts      ON requests (ts);
 CREATE INDEX IF NOT EXISTS idx_req_account ON requests (account);
@@ -68,6 +70,7 @@ _COLUMNS = (
     "model", "requested_model", "stream", "outcome", "http_status", "error",
     "total_ms", "ttft_ms", "gen_ms", "input_tokens", "output_tokens", "cached_tokens",
     "credit", "tokens_per_sec", "cache_hit_pct", "usage_missing", "preview", "client",
+    "switches",
 )
 
 # 每批最多写多少行（一次事务 / 一次 fsync）
@@ -104,6 +107,13 @@ class UsageLog:
     def _init_db(self) -> None:
         with closing(self._connect()) as conn:
             conn.executescript(_SCHEMA)
+            # 旧库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加新列。
+            # 逐列尝试、重复列报错吞掉 —— 新装库走 _SCHEMA 已有列，这里只为存量库兜底。
+            for stmt in ("ALTER TABLE requests ADD COLUMN switches TEXT NOT NULL DEFAULT '[]'",):
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass
             conn.commit()
 
     # ── 写 ───────────────────────────────────────────────────────────────────
@@ -214,7 +224,21 @@ class UsageLog:
                 f"SELECT * FROM requests{clause} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
                 (*params, limit, offset),
             ).fetchall()
-        return [dict(r) for r in rows], int(total)
+        return [self._decode(dict(r)) for r in rows], int(total)
+
+    @staticmethod
+    def _decode(row: dict) -> dict:
+        """读出侧反归一化：switches 从 JSON 文本还原成列表（坏数据当空）。"""
+        raw = row.get("switches")
+        if isinstance(raw, str) and raw:
+            try:
+                parsed = json.loads(raw)
+                row["switches"] = parsed if isinstance(parsed, list) else []
+            except (ValueError, TypeError):
+                row["switches"] = []
+        elif not isinstance(raw, list):
+            row["switches"] = []
+        return row
 
     def stats(self, where: str = "", params: tuple = ()) -> dict:
         """区间聚合：总量、成功率、时延、token、缓存命中、tok/s。"""
@@ -316,6 +340,9 @@ def _normalize(key: str, value):
     """按列语义归一化：数据库里不放大对象、不写 None 到 NOT NULL 列。"""
     if key in ("stream", "usage_missing"):
         return 1 if value else 0
+    if key == "switches":
+        # 换号轨迹以 JSON 文本落库；空列表归一成 '[]'（列是 NOT NULL）
+        return json.dumps(value or [], ensure_ascii=False, separators=(",", ":"))
     if value is None:
         return None if key in ("http_status", "total_ms", "ttft_ms", "gen_ms",
                                "input_tokens", "output_tokens", "cached_tokens",

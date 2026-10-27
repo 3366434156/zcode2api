@@ -4,7 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>zcode-hub · 请求监控</title>
-  <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
   <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
 </head>
 <body>
@@ -155,6 +154,15 @@ function swapTag(e){
   return `<span class="mon-swap" title="客户端请求 ${esc(req)}，实际由 ${esc(model)} 服务">换模型</span>`;
 }
 
+/* 换号标记：这个请求中途换过账号（额度用完/风控/并发满…）。悬停看完整轨迹：
+   从谁换成谁、为什么。没有轨迹就什么都不显示——没换号不值得占一行。 */
+function switchTag(e){
+  const list = Array.isArray(e.switches) ? e.switches : [];
+  if(!list.length) return '';
+  const detail = list.map(s => `${s.from || '—'} → ${s.to || '—'}：${s.why || '未记录'}`).join('\n');
+  return `<span class="mon-swap mon-switch" title="换号 ${list.length} 次：\n${esc(detail)}">换号 ${list.length}</span>`;
+}
+
 function statusCell(e){
   if(e.outcome==null && e.ok===null)return `<span class="badge badge-cooling">进行中</span>`;
   const outcome = e.outcome || (e.ok ? 'completed' : 'failed');
@@ -202,7 +210,7 @@ function renderDetail(){
   const body = rows.map((e,i)=>`
     <div class="mon-row mon-grid-detail mon-clickable" onclick="openDetail(${i})">
       <span class="mon-time">${fmtTs(e.ts)}</span>
-      <span class="mon-name" title="${esc(e.account||'')}">${esc(e.account||'—')}${e.mode?` <span class="tier-b ${e.mode==='jwt'?'jwt':'other'}">${e.mode==='jwt'?'JWT':'KEY'}</span>`:''}</span>
+      <span class="mon-name" title="${esc(e.account||'')}">${esc(e.account||'—')}${e.mode?` <span class="tier-b ${e.mode==='jwt'?'jwt':'other'}">${e.mode==='jwt'?'JWT':'KEY'}</span>`:''}${switchTag(e)}</span>
       <span class="mon-model" title="${esc(e.model||'')}${e.requested_model?` (请求 ${esc(e.requested_model)})`:''}">${esc(e.model||'—')}${swapTag(e)}</span>
       <span>${outcomeBadge(e.outcome, e.http_status)}${streamTag(e.stream)}</span>
       <span class="mon-num">${e.http_status??'—'}</span>
@@ -265,7 +273,7 @@ function renderLive(){
       ? (e.cached_tokens*100/((e.input_tokens||0)+e.cached_tokens)).toFixed(0)+'%' : '—';
     return `<div class="mon-row mon-grid-live">
       <span class="mon-time">${fmtTs(e.ts)}</span>
-      <span class="mon-name" title="${esc(e.account||'')}">${esc(e.account||'—')}${e.mode?` <span class="tier-b ${e.mode==='jwt'?'jwt':'other'}">${e.mode==='jwt'?'JWT':'KEY'}</span>`:''}</span>
+      <span class="mon-name" title="${esc(e.account||'')}">${esc(e.account||'—')}${e.mode?` <span class="tier-b ${e.mode==='jwt'?'jwt':'other'}">${e.mode==='jwt'?'JWT':'KEY'}</span>`:''}${switchTag(e)}</span>
       <span class="mon-model" title="${esc(e.model||'')}">${esc(e.model||'—')}${swapTag(e)}</span>
       <span>${statusCell(e)}</span>
       <span class="mon-num">${fmtMs(ttft)}</span>
@@ -326,6 +334,7 @@ function openDetail(i){
       ${kv('端点', esc(e.endpoint))}
       ${kv('账号', esc(e.account||'—') + (e.mode?` · ${e.mode==='jwt'?'JWT':'API Key'}`:''))}
       ${kv('模型', esc(e.model) + (e.requested_model?` <span class="mon-muted">（请求 ${esc(e.requested_model)}）</span>`:''))}
+      ${(Array.isArray(e.switches)&&e.switches.length)?`<div class="mon-detail-block"><div class="mon-detail-label">换号轨迹（${e.switches.length} 次）</div><pre class="mon-pre">${esc(e.switches.map(s=>`${s.from||'—'} → ${s.to||'—'}：${s.why||'未记录'}`).join('\n'))}</pre></div>`:''}
       ${kv('流式', e.stream?'是':'否')}
       ${kv('结果', `${OUTCOME_LABEL[e.outcome]||e.outcome}${e.http_status?` · HTTP ${e.http_status}`:''}`)}
       ${kv('首字延迟', fmtMs(e.ttft_ms))}

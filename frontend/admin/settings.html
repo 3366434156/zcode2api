@@ -4,8 +4,34 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>zcode-hub · 设置</title>
-  <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
   <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
+  <style>
+    /* 从「客户端接入」页并入的样式（原 agents.html <style>，逐行搬来） */
+    .cone-card{margin-bottom:16px}
+    .cone-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
+    .cone-title{display:flex;align-items:center;gap:8px;font-size:15px;font-weight:600}
+    .cone-desc{margin-top:6px;font-size:12.5px;line-height:1.75;color:var(--muted);max-width:720px}
+    .cone-actions{display:flex;gap:8px;flex-wrap:wrap}
+    .cone-meta{margin-top:14px;display:grid;gap:7px;font-size:12.5px}
+    .cone-meta .cone-k{display:inline-block;min-width:64px;color:var(--muted)}
+    .cone-meta code{font-family:var(--mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:12px;
+      background:var(--surface-2,#f6f7f9);border-radius:4px;padding:1px 6px;word-break:break-all}
+    .cone-notes{margin-top:12px;font-size:12.5px;line-height:1.85;color:var(--muted)}
+    .cone-notes li{margin-left:16px}
+    .cone-models{display:flex;gap:6px;flex-wrap:wrap;margin-top:2px}
+    .cone-warn{margin-top:10px;font-size:12.5px;line-height:1.7;padding:9px 12px;border-radius:8px;
+      background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.28);color:#a16207}
+    .cone-badges{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+    .cone-remote{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+    .cone-remote-block{border:1px solid var(--line,#e6e8ec);border-radius:10px;padding:14px}
+    .cone-remote-hd{font-size:13.5px;font-weight:600;margin-bottom:6px}
+    .cone-cmd{display:flex;gap:8px;align-items:flex-start;margin-top:10px}
+    .cone-cmd code{flex:1;font-family:var(--mono,ui-monospace,SFMono-Regular,Menlo,monospace);
+      font-size:11.5px;line-height:1.6;background:var(--surface-2,#f6f7f9);border-radius:6px;
+      padding:8px 10px;overflow-x:auto;white-space:pre-wrap;word-break:break-all}
+    .cone-secret{font-size:11.5px;color:var(--muted);margin-top:6px}
+    .cone-form{display:grid;gap:8px;margin-top:10px}
+  </style>
 </head>
 <body>
 <div id="admin-header" data-active="/admin/settings"></div>
@@ -14,18 +40,39 @@
   <div class="page-hd">
     <div>
       <div class="page-title">设置</div>
-      <div class="page-sub">后台鉴权密钥与网关访问控制</div>
+      <div class="page-sub">后台鉴权 · 网关访问控制 · 客户端接入</div>
     </div>
   </div>
 
-  <div class="settings-card" id="deploy-card">
-    <div class="section-title" style="margin-bottom:8px">客户端一键部署</div>
-    <div class="hint" style="margin-bottom:10px">把本网关一键写进 AI 客户端（magpie 等）的配置：只加一条 provider，写前备份、可一键还原；
-      多台电脑用 magpie 的 GitHub 加密同步共享同一套配置。</div>
-    <div class="hint" id="deploy-status">加载中…</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
-      <button class="btn btn-primary" id="deploy-magpie" onclick="deployMagpie()">一键接入 magpie</button>
-      <a class="btn btn-ghost" href="/admin/agents" style="text-decoration:none;display:inline-flex;align-items:center">打开「客户端接入」页</a>
+  <div class="settings-card" id="paste-card">
+    <div class="section-title" style="margin-bottom:6px">客户端接入 · 别的电脑上「粘三样」就能用</div>
+    <div class="hint" style="margin-bottom:10px">任何 OpenAI / Anthropic 兼容客户端都只用这三样：
+      不用装 magpie、不用改脚本、不用同步。把下面几行分别粘到客户端的「Base URL / API Key / 模型」里即可。</div>
+    <div class="cone-meta" id="paste-rows"><div class="hint">加载中…</div></div>
+    <div class="hint" id="deploy-status" style="margin-top:12px">加载中…</div>
+  </div>
+
+  <div class="settings-card" id="gateway-card">
+    <div class="section-title" style="margin-bottom:12px">本网关</div>
+    <div class="cone-meta" id="gateway-meta"><div class="hint">加载中…</div></div>
+  </div>
+
+  <div class="settings-card" id="remote-card">
+    <div class="section-title" style="margin-bottom:8px">其他电脑（局域网）</div>
+    <div class="hint" style="margin-bottom:12px">让别的电脑用上这台机器的额度：选一种方式，把对端要跑的那行命令复制过去执行即可。</div>
+    <div id="remote-body"><div class="hint">加载中…</div></div>
+  </div>
+
+  <div id="client-list"></div>
+
+  <div class="settings-card">
+    <div class="section-title" style="margin-bottom:12px">一键接入做了什么</div>
+    <div class="hint" style="line-height:1.9">
+      · 只往客户端配置里写一条 provider（id 固定为 <code>zcode2api</code>），其它 provider、routing group、自定义字段原样保留。<br>
+      · 写入前自动备份原件（首次接入前的版本永久保留），文件以 0600 落盘，采用临时文件 + 原子替换。<br>
+      · 「一键还原」回到首次接入前的字节；若期间你或客户端自己改过该文件，则只摘掉本网关那一条，不覆盖你的改动。<br>
+      · 客户端不在本机（例如 magpie 跑在另一台电脑）时，可改用命令行：
+      <code>python -m app.clients apply --client magpie --base-url &lt;网关地址&gt; --key &lt;网关 Key&gt;</code>
     </div>
   </div>
 
@@ -51,6 +98,14 @@
       <label>单账号并发上限</label>
       <div class="hint">每个账号同时处理的最大请求数；某账号并发满时自动切下一个账号。默认为 1（上游对「账号 × 模型」并发硬限很低，超了会回 429 code 3009），并发能力因此等于账号数。设为 0 不限制。修改后即时生效。</div>
       <input class="input" id="account-concurrency" type="number" min="0" step="1" placeholder="1">
+    </div>
+    <div class="settings-row">
+      <label>全局粘号</label>
+      <div class="hint">所有会话的流量都尽量留在同一个账号上，只有它不可用（额度用完 / 冷却 / 并发满 / 凭证失效）才轮询下一个——上游按「账号 × 模型」计并发租约，摊开到多个号并不能提高并发上限，只会让请求监控看起来一直在跳号。会话粘性优先级更高：同一段对话先回它上次用的号。默认开启。</div>
+      <label style="display:inline-flex;align-items:center;gap:8px;font-weight:500;font-size:13px">
+        <input type="checkbox" class="cb" id="account-sticky" checked>
+        正常情况下固定用一个账号
+      </label>
     </div>
     <div class="settings-row">
       <label>套餐自动领取轮（秒）</label>
@@ -124,41 +179,254 @@
   const lan=document.getElementById('lan-url');
   if(lan)lan.textContent=location.origin+'/admin';
   load();
-  renderDeploy();
+  loadAgents();   // 客户端接入并入本页后，两块数据各自加载互不阻塞
 })();
 
 /* 同时转义引号：模型状态表的判死原因来自上游错误原文，会进 title/data-* 属性，
    不转义引号就会把属性截断（甚至注入标签）。 */
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 
-/* 客户端一键部署：状态摘要 + 直接接入 magpie（详细操作在「客户端接入」页） */
-async function renderDeploy(){
-  const box=document.getElementById('deploy-status');
-  if(!box)return;
-  try{
-    const d=await api('GET','/agents');
-    const c=(d.clients||[]).find(x=>x.id==='magpie')||{};
-    const s=(d.remote&&d.remote.magpie&&d.remote.magpie.sync)||{};
-    const bits=[
-      c.installed?'magpie 已安装':'magpie 未检测到',
-      c.configured?`已接入（指向 ${c.applied?.base_url||'—'}）`:'未接入',
-      c.running?'正在运行':'未运行',
-      s.enabled?`GitHub 同步已开${s.last?' · 上次 '+String(s.last).replace('T',' ').slice(0,16):''}`:'GitHub 同步未开',
-    ];
-    box.innerHTML=bits.map(esc).join(' · ');
-    const btn=document.getElementById('deploy-magpie');
-    if(btn)btn.textContent=c.configured?'重新接入 magpie':'一键接入 magpie';
-  }catch(e){box.textContent='读取状态失败: '+e.message;}
+/* ── 客户端接入（原「客户端接入」页并入）────────────────────────────────
+   与设置共用一个页面后，agents 的数据加载叫 loadAgents，避免和设置自己的
+   load() 重名（重名会互相覆盖，先注册的那个直接失效）。 */
+let state=null;
+
+function badge(text,tone){
+  const cls={ok:'badge-active',warn:'badge-cooling',bad:'badge-invalid',info:'badge-jwt'}[tone]||'badge-jwt';
+  return `<span class="badge ${cls}">${esc(text)}</span>`;
 }
 
-async function deployMagpie(){
-  if(!confirm('把 magpie 的配置指向本网关？\n\n写前自动备份，可随时在「客户端接入」页一键还原。'))return;
+async function loadAgents(){
   try{
-    const r=await api('POST','/agents/apply',{client:'magpie'});
-    const acts=(r.records||[]).map(x=>x.action).join(', ');
-    showToast('已接入 magpie（'+acts+'）','success');
-    renderDeploy();
+    state=await api('GET','/agents');
+    renderPaste();
+    renderGateway();
+    renderRemote();
+    renderClients();
+    renderDeployStatus();
+  }catch(e){showToast('客户端接入状态加载失败: '+e.message,'error');}
+}
+
+/* 部署状态摘要：并入后只保留一行摘要，操作入口都在上面的接入卡里 */
+function renderDeployStatus(){
+  const box=document.getElementById('deploy-status');
+  if(!box)return;
+  const c=(state.clients||[]).find(x=>x.id==='magpie')||{};
+  const s=(state.remote&&state.remote.magpie&&state.remote.magpie.sync)||{};
+  const bits=[
+    c.installed?'magpie 已安装':'magpie 未检测到',
+    c.configured?`已接入（指向 ${c.applied?.base_url||'—'}）`:'未接入',
+    c.running?'正在运行':'未运行',
+    s.enabled?`GitHub 同步已开${s.last?' · 上次 '+String(s.last).replace('T',' ').slice(0,16):''}`:'GitHub 同步未开',
+  ];
+  box.innerHTML=bits.map(esc).join(' · ');
+}
+
+/* 粘贴区：OpenAI / Anthropic 地址 + Key + 模型，各带复制按钮 */
+function renderPaste(){
+  const box=document.getElementById('paste-rows');
+  if(!box)return;
+  const p=state?.remote?.gateway?.paste;
+  if(!p){box.innerHTML='<div class="hint">—</div>';return;}
+  const row=(label,shown,kind)=>`<div style="display:flex;gap:8px;align-items:center">
+      <span class="cone-k" style="min-width:110px">${label}</span>
+      <code style="flex:1">${esc(shown)}</code>
+      <button class="btn btn-ghost" onclick="copyValue('${kind}')">复制</button>
+    </div>`;
+  box.innerHTML=[
+    row('OpenAI 兼容地址', p.openai_base||'—', 'openai'),
+    row('Anthropic 地址', p.anthropic_base||'—', 'anthropic'),
+    row('API Key', p.key_set===false?'（未启用）':(p.key_masked||'—'), 'key'),
+    row('模型名', (p.models||[]).join(' / ')||'—', 'models'),
+  ].join('');
+}
+
+async function copyValue(kind){
+  const p=state?.remote?.gateway?.paste||{};
+  const map={openai:p.openai_base, anthropic:p.anthropic_base, key:p.key,
+             models:(p.models||[]).join(',')};
+  const v=map[kind];
+  if(!v){showToast('没有可复制的内容','error');return;}
+  try{await navigator.clipboard.writeText(v);showToast('已复制','success');}
+  catch{showToast('复制失败，请手动选中','error');}
+}
+
+function renderRemote(){
+  const box=document.getElementById('remote-body');
+  const r=state?.remote;
+  if(!r){box.innerHTML='<div class="hint">—</div>';return;}
+  if(!r.lan_ips?.length){
+    box.innerHTML='<div class="cone-warn">没检测到局域网地址（这台机器可能没连网络）：其它电脑暂时连不进来。</div>';
+    return;
+  }
+  const g=r.gateway||{}, m=r.magpie||{}, s=m.sync||{};
+  const keyBadge=g.key_set?badge('网关 Key 已设置','ok'):badge('网关 Key 未设置（局域网内任何人可直连）','warn');
+  const syncBadge=s.enabled?badge('GitHub 同步已开启','ok'):badge('GitHub 同步未开启','warn');
+  const cmdBox=(id,text)=>`<div class="cone-cmd"><code id="${id}">${esc(text)}</code><button class="btn btn-ghost" onclick="copyText('${id}')">复制</button></div>`;
+  box.innerHTML=`
+    <div class="cone-remote">
+      <div class="cone-remote-block">
+        <div class="cone-remote-hd">① GitHub 加密同步（magpie 的「同步与备份」，推荐）</div>
+        <div class="hint">本机 magpie 把 providers（含 API Key）、设置、Profile、agent 模型加密后压进私有仓库；
+          另一台电脑接同一仓库 + 同一口令，就拿到同一个 <code>zcode2api</code> provider（连网关 Key 一起）。</div>
+        <div class="cone-badges" style="margin:10px 0">${syncBadge}
+          ${s.last?badge('上次同步 '+esc(s.last.replace('T',' ').slice(0,19)),'info'):''}
+          ${s.keys?badge('含供应商 Key','info'):badge('未含供应商 Key','warn')}</div>
+        ${s.enabled?`<div class="cone-secret">仓库：<code>${esc(s.repo||s.url)}</code> · 令牌 ${esc(s.token_masked||'')} · 口令${s.passphrase_set?'已设置':'<b>未设置</b>'}</div>
+          ${cmdBox('cmd-sync',m.other_machine_command||'')}
+          <div class="hint" style="margin-top:8px">上面这行在<b>另一台电脑</b>执行（同样的令牌与口令）；口令在本机 <code>~/.config/magpie/sync.json</code>，或你保存的那份。</div>
+          <button class="btn btn-primary" style="margin-top:10px" onclick="syncNow()">立即同步</button>`
+        :`<div class="hint">还没开同步。填仓库/令牌/口令后一键开启（口令每台电脑必须一致；GitHub 上只有密文）。</div>
+          <div class="cone-form">
+            <input class="input" id="sync-repo" placeholder="owner/repo（私有空仓库）">
+            <input class="input" id="sync-token" type="password" placeholder="GitHub 令牌（该仓库 Contents 读写）">
+            <input class="input" id="sync-pass" type="password" placeholder="同步口令">
+          </div>
+          <button class="btn btn-primary" style="margin-top:10px" onclick="enableSync()">一键开启并推送</button>`}
+      </div>
+      <div class="cone-remote-block">
+        <div class="cone-remote-hd">② 直连本网关（对端 magpie 把 zcode2api 当 provider）</div>
+        <div class="hint">不经同步、不经中转，对端直接连本网关。本机地址：${(g.urls||[]).map(u=>`<code>${esc(u)}</code>`).join(' / ')||'—'}</div>
+        <div class="cone-badges" style="margin:10px 0">${keyBadge}</div>
+        ${cmdBox('cmd-direct',g.direct_command||'')}
+        ${g.key_set?'':`<button class="btn btn-primary" style="margin-top:10px" onclick="genGatewayKey()">生成网关 Key（推荐）</button>`}
+        <div class="hint" style="margin-top:8px">也可以用导入链接：${g.import_link?`<a href="${esc(g.import_link)}">magpie://import…</a>`:'—'}；
+          或者在对端跑 <code>${esc(g.cli_command||'')}</code>。</div>
+      </div>
+    </div>`;
+}
+
+async function syncNow(){
+  try{
+    const r=await api('POST','/agents/magpie/sync-now');
+    showToast(r.ok?'已同步':'同步失败', r.ok?'success':'error');
+    if(!r.ok&&r.output)console.warn(r.output);
+    loadAgents();
+  }catch(e){showToast('同步失败: '+e.message,'error');}
+}
+
+async function enableSync(){
+  const repo=document.getElementById('sync-repo')?.value.trim();
+  const token=document.getElementById('sync-token')?.value.trim();
+  const passphrase=document.getElementById('sync-pass')?.value.trim();
+  if(!repo||!token||!passphrase){showToast('仓库 / 令牌 / 口令都要填','error');return;}
+  if(!confirm('开启 GitHub 加密同步并立刻推送？（仓库须已存在且为私有）'))return;
+  try{
+    const r=await api('POST','/agents/magpie/sync',{repo,token,passphrase});
+    showToast('已开启同步'+(r.ok?'并推送':'（推送待确认）'),'success');
+    loadAgents();
+  }catch(e){showToast('开启失败: '+e.message,'error');}
+}
+
+async function genGatewayKey(){
+  if(!confirm('生成新的网关 API Key？\n\n生成后所有调用 /v1/* 的客户端都必须带这个 Key；已接入的客户端会自动刷新成新 Key。')){
+    return;
+  }
+  try{
+    const r=await api('POST','/agents/gateway-key');
+    try{await navigator.clipboard.writeText(r.gateway_key);}catch{}
+    showToast('已生成网关 Key 并复制到剪贴板：'+r.gateway_key,'success');
+    loadAgents();
+  }catch(e){showToast('生成失败: '+e.message,'error');}
+}
+
+async function copyText(id){
+  const el=document.getElementById(id);
+  if(!el)return;
+  try{await navigator.clipboard.writeText(el.textContent.trim());showToast('已复制','success');}
+  catch{showToast('复制失败，请手动选中复制','error');}
+}
+
+function renderGateway(){
+  const g=state.gateway||{};
+  const models=(state.models||[]).map(m=>`<span class="badge badge-jwt">${esc(m)}</span>`).join(' ');
+  document.getElementById('gateway-meta').innerHTML=`
+    <div><span class="cone-k">Anthropic</span><code>${esc(g.base_url)}</code></div>
+    <div><span class="cone-k">OpenAI</span><code>${esc(g.base_url_v1)}</code></div>
+    <div><span class="cone-k">网关 Key</span>${g.key_set?badge('已启用','ok'):badge('未启用（本地客户端可直接连）','warn')}</div>
+    <div><span class="cone-k">模型</span><span class="cone-models">${models||'—'}</span></div>
+    <div><span class="cone-k">状态目录</span><code>${esc(state.state_dir)}</code></div>
+  `;
+}
+
+function renderClients(){
+  const box=document.getElementById('client-list');
+  if(!state.clients?.length){box.innerHTML='<div class="settings-card"><div class="hint">当前没有支持的客户端。</div></div>';return;}
+  box.innerHTML=state.clients.map(c=>{
+    const badges=[
+      c.installed?badge('已安装','ok'):badge('未检测到','warn'),
+      c.configured?badge('已接入','ok'):badge('未接入','info'),
+      c.running===true?badge('magpie 正在运行','info'):'',
+      c.external_change?badge('文件被外部修改','warn'):'',
+    ].filter(Boolean).join(' ');
+    const applied=c.applied?`
+      <div><span class="cone-k">接入时间</span>${esc(c.applied.at)}</div>
+      <div><span class="cone-k">指向</span><code>${esc(c.applied.base_url)}</code></div>
+      <div><span class="cone-k">模型</span><span class="cone-models">${(c.applied.models||[]).map(m=>`<span class="badge badge-jwt">${esc(m)}</span>`).join(' ')||'—'}</span></div>
+    `:'';
+    const warn=[];
+    if(!c.installed)warn.push('没有检测到本机安装该客户端：仍可写入配置（会用默认配置目录），装好启动即生效。');
+    if(c.external_change)warn.push('上次写入后文件被外部改动过：还原时只会摘掉本网关那一条 provider，其它改动保留。');
+    if(c.configured&&c.running===true)warn.push('客户端正在运行：配置已生效于下一次读取；若发现改动被覆盖，退出客户端后重新接入一次。');
+    const warnHtml=warn.length?`<div class="cone-warn">${warn.map(esc).join('<br>')}</div>`:'';
+    const link=c.import_link||'';
+    const linkBtn=link?`<button class="btn btn-ghost" onclick="copyLink('${esc(c.id)}')">复制导入链接</button>
+      <a class="btn btn-ghost" href="${esc(link)}" style="text-decoration:none;display:inline-flex;align-items:center">打开导入链接</a>`:'';
+    const restoreBtn=c.configured?`<button class="btn btn-danger" onclick="doRestore('${esc(c.id)}')">一键还原</button>`:'';
+    return `
+    <div class="settings-card cone-card">
+      <div class="cone-head">
+        <div>
+          <div class="cone-title">${esc(c.label)}<span class="cone-badges">${badges}</span></div>
+          <div class="cone-desc">${esc(c.desc)}</div>
+        </div>
+        <div class="cone-actions">
+          <button class="btn btn-primary" onclick="doApply('${esc(c.id)}')">${c.configured?'重新接入':'一键接入'}</button>
+          ${linkBtn}
+          ${restoreBtn}
+        </div>
+      </div>
+      <div class="cone-meta">
+        <div><span class="cone-k">写入</span><code>${esc(c.write_target)}</code></div>
+        ${c.config_paths.filter(p=>p!==c.write_target).map(p=>`<div><span class="cone-k">相关</span><code>${esc(p)}</code></div>`).join('')}
+        ${applied}
+      </div>
+      ${warnHtml}
+      ${(c.notes||[]).length?`<ul class="cone-notes">${c.notes.map(n=>`<li>${esc(n)}</li>`).join('')}</ul>`:''}
+    </div>`;
+  }).join('');
+}
+
+function clientOf(id){return (state?.clients||[]).find(c=>c.id===id);}
+
+async function doApply(id){
+  const c=clientOf(id);
+  if(!c)return;
+  if(!confirm(`把 ${c.label} 的配置指向本网关？\n\n将写入：${c.write_target}\n写前会自动备份原件，可随时「一键还原」。`))return;
+  try{
+    const r=await api('POST','/agents/apply',{client:id});
+    showToast(`已接入 ${c.label}（${(r.records||[]).map(x=>x.action).join(', ')}）`,'success');
+    loadAgents();
   }catch(e){showToast('接入失败: '+e.message,'error');}
+}
+
+async function doRestore(id){
+  const c=clientOf(id);
+  if(!c)return;
+  if(!confirm(`把 ${c.label} 的配置还原到首次接入前？\n\n会撤销本网关写入的内容。`))return;
+  try{
+    const r=await api('POST','/agents/restore',{client:id});
+    const acts=(r.restored||[]).map(x=>x.action).join(', ')||r.note||'无变化';
+    showToast(`已还原 ${c.label}（${acts}）`,'success');
+    loadAgents();
+  }catch(e){showToast('还原失败: '+e.message,'error');}
+}
+
+async function copyLink(id){
+  const c=clientOf(id);
+  if(!c?.import_link)return;
+  try{await navigator.clipboard.writeText(c.import_link);showToast('导入链接已复制，粘贴到浏览器地址栏即可唤起 '+c.label,'success');}
+  catch{showToast('复制失败，请手动从「打开导入链接」复制','error');}
 }
 
 async function load(){
@@ -169,6 +437,7 @@ async function load(){
     document.getElementById('quota-interval').value=d.quota_refresh_interval??1800;
     document.getElementById('account-concurrency').value=d.account_concurrency??1;
     document.getElementById('claim-round-interval').value=d.claim_round_interval??3600;
+    document.getElementById('account-sticky').checked=d.account_sticky!==false;
     document.getElementById('model-fallback-enabled').checked=d.model_fallback_enabled!==false;
     document.getElementById('model-fallback-chain').value=d.model_fallback_chain||'';
     document.getElementById('model-fallback-ttl').value=d.model_fallback_ttl??600;
@@ -260,7 +529,8 @@ async function saveSettings(){
   const model_fallback_ttl=parseInt(document.getElementById('model-fallback-ttl').value,10);
   if(isNaN(model_fallback_ttl)||model_fallback_ttl<0)return showToast('模型兜底冷却必须是非负整数（0 = 不跳过）','error');
   const payload={quota_refresh_interval,account_concurrency,claim_round_interval,
-                 model_fallback_enabled,model_fallback_chain,model_fallback_ttl};
+                 model_fallback_enabled,model_fallback_chain,model_fallback_ttl,
+                 account_sticky:document.getElementById('account-sticky').checked};
   if(!_isSecretMask(admin_key)) payload.admin_key=admin_key;
   if(!_isSecretMask(gateway_key)) payload.gateway_key=gateway_key;
   try{
