@@ -15,7 +15,14 @@ ADMIN_AUTH = {"Authorization": "Bearer zcode"}  # 默认后台密钥
 
 
 @pytest.fixture(autouse=True)
-def _clean_reqlog():
+def _clean_reqlog(fresh_app):
+    """清掉实时内存环（reqlog._entries 是模块级 deque，跨用例共享）。
+
+    必须依赖 fresh_app：`reqlog.clear()` 会连带清空持久台账（usagelog），而
+    conftest 是在 fresh_app 里把 `reqlog.usagelog` 重绑到 tmp 库的。不依赖它，
+    这个 fixture 就会在重绑之前跑，**清掉真实的 data/usage.db**（实测跑三次
+    全量测试把用户当天台账清空三次）。fresh_app 同时提供 store 隔离，正好。
+    """
     from app import reqlog
 
     reqlog.clear()

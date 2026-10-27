@@ -14,7 +14,7 @@ from . import logs, settings
 from .captcha import captcha_manager
 from .claim import claim_round
 from .quota import monitor
-from .routes import admin_api, admin_logs, gateway, pages
+from .routes import admin_api, admin_logs, admin_tunnel, gateway, pages
 
 # 修正 Windows 中文控制台可能出现的乱码
 for _stream in (sys.stdout, sys.stderr):
@@ -148,6 +148,9 @@ async def lifespan(app: FastAPI):
     captcha_manager.start()   # 验证码预解池后台补充
     claim_round.start()       # 套餐自动领取轮（间隔 0 = 关闭）
     _run_install_sequence_on_start()
+    from .tunnel import tunnel
+
+    tunnel.autostart()        # 公网隧道（ZCODE_TUNNEL=1 或后台开过）
     base = f"http://{_display_host()}:{settings.PORT}"
     logs.banner([
         f"{logs._B}{logs._MAG}zcode-hub{logs._R} {logs._DIM}v{settings.APP_VERSION} · Python{logs._R}",
@@ -157,6 +160,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        tunnel.stop(persist=False)
         await monitor.stop()
         await claim_round.stop()
         await captcha_manager.close()
@@ -173,6 +177,7 @@ def create_app() -> FastAPI:
     # 网关日志单独一个 router：它的数据源（logstore）与请求台账完全独立，
     # 拆开可以让「日志」随时增删而不碰 admin_api 这个已经很大的文件
     app.include_router(admin_logs.router, prefix="/admin/api")
+    app.include_router(admin_tunnel.router)
     app.include_router(gateway.router)
     return app
 

@@ -57,6 +57,13 @@
     <div class="cone-meta" id="gateway-meta"><div class="hint">加载中…</div></div>
   </div>
 
+  <div class="settings-card" id="tunnel-card">
+    <div class="section-title" style="margin-bottom:6px">公网访问 · 其它网络也能用</div>
+    <div class="hint" style="margin-bottom:12px">走 Cloudflare 隧道，不用公网 IP、不用在路由器上开端口；
+      手机流量、公司电脑、朋友家都能直接调本网关。</div>
+    <div id="tunnel-body"><div class="hint">加载中…</div></div>
+  </div>
+
   <div class="settings-card" id="remote-card">
     <div class="section-title" style="margin-bottom:8px">其他电脑（局域网）</div>
     <div class="hint" style="margin-bottom:12px">让别的电脑用上这台机器的额度：选一种方式，把对端要跑的那行命令复制过去执行即可。</div>
@@ -180,6 +187,7 @@
   if(lan)lan.textContent=location.origin+'/admin';
   load();
   loadAgents();   // 客户端接入并入本页后，两块数据各自加载互不阻塞
+  loadTunnel();   // 公网隧道状态：地址由云端分配，单独一次请求
 })();
 
 /* 同时转义引号：模型状态表的判死原因来自上游错误原文，会进 title/data-* 属性，
@@ -348,6 +356,131 @@ function renderGateway(){
     <div><span class="cone-k">状态目录</span><code>${esc(state.state_dir)}</code></div>
   `;
 }
+
+/* ── 公网访问（cloudflared 隧道）────────────────────────────────────────
+   临时隧道每次启动换一个随机域名，所以地址只以后端状态为准、前端不缓存：
+   换了域名页面必须立刻能看出来。 */
+let tunnelState=null;
+let tunnelPoll=null;
+
+async function loadTunnel(){
+  const box=document.getElementById('tunnel-body');
+  try{
+    tunnelState=await api('GET','/tunnel');
+    renderTunnel();
+  }catch(e){
+    if(box)box.innerHTML=`<div class="hint">状态加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function fmtUptime(s){
+  if(!s)return '';
+  if(s<60)return s+' 秒';
+  if(s<3600)return Math.floor(s/60)+' 分钟';
+  return Math.floor(s/3600)+' 小时';
+}
+
+function renderTunnel(){
+  const box=document.getElementById('tunnel-body');
+  if(!box)return;
+  const t=tunnelState||{};
+  if(!t.available){
+    box.innerHTML=`<div class="cone-warn">没找到 <code>cloudflared</code>，公网访问不可用。
+      装一个即可：<code>winget install Cloudflare.cloudflared</code>；
+      或用环境变量 <code>ZCODE_CLOUDFLARED</code> 指向已有 exe。</div>`;
+    return;
+  }
+  const warn=(t.warnings||[]).map(w=>`<div class="cone-warn">${esc(w)}</div>`).join('');
+  if(!t.running){
+    const lastErr=t.error&&/退出|失败|重试/.test(t.error)
+      ?`<div class="hint" style="color:var(--red);margin-bottom:8px">${esc(t.error)}</div>`:'';
+    box.innerHTML=`
+      ${lastErr}${warn}
+      <div class="hint">点一下给本机开一条隧道，几秒后拿到公网地址。临时地址随进程变化，
+        网关一关就失效——适合临时给别人的设备、手机流量访问。</div>
+      <div class="tunnel-actions">
+        <button class="btn btn-primary" onclick="startTunnel('quick')">一键开启公网访问</button>
+      </div>
+      <details class="tunnel-more">
+        <summary>固定域名（Cloudflare 控制台建隧道 → 复制 token）</summary>
+        <div class="hint">控制台的 Public Hostname 指向 <code>http://127.0.0.1:${esc(t.port||3000)}</code>，
+          再把隧道 token 粘进来：重启网关后域名不变。</div>
+        <div class="tunnel-token">
+          <input class="input" id="tunnel-token" type="password" placeholder="隧道 token（eyJhIjoi…）" autocomplete="off">
+          <button class="btn btn-ghost" onclick="startTunnel('token')">用 token 启动</button>
+        </div>
+      </details>`;
+    return;
+  }
+  const url=t.url||'';
+  box.innerHTML=`
+    ${warn}
+    <div class="tunnel-live">
+      <span class="badge ${url?'badge-active':'badge-cooling'}">${url?'已开启':'连接中'} · ${t.mode==='token'?'固定域名':'临时隧道'}</span>
+      ${t.uptime?`<span class="hint">已运行 ${esc(fmtUptime(t.uptime))}</span>`:''}
+      ${t.restarts?`<span class="hint">重连过 ${t.restarts} 次</span>`:''}
+    </div>
+    ${url?`
+      <div class="tunnel-url"><code>${esc(url)}</code></div>
+      <div class="cone-meta" style="margin-top:10px">
+        <div><span class="cone-k">OpenAI</span><code>${esc(url)}/v1</code></div>
+        <div><span class="cone-k">Anthropic</span><code>${esc(url)}</code></div>
+        <div><span class="cone-k">API Key</span><span class="hint">同上方的网关 Key（公网访问必须已设置）</span></div>
+      </div>`
+    :`<div class="hint" style="margin-top:10px">正在向 Cloudflare 申请地址…一般 3–8 秒。</div>
+      ${t.error?`<div class="hint" style="color:var(--amber)">${esc(t.error)}</div>`:''}`}
+    <div class="tunnel-actions">
+      ${url?`<button class="btn btn-ghost" onclick="copyTunnel()">复制接入信息</button>`:''}
+      <button class="btn btn-danger" onclick="stopTunnel()">关闭公网访问</button>
+    </div>`;
+}
+
+function pollTunnel(limit=30){
+  clearTimeout(tunnelPoll);
+  let n=0;
+  const tick=async()=>{
+    n++;
+    try{tunnelState=await api('GET','/tunnel');renderTunnel();}catch{}
+    if(tunnelState?.url)return;
+    if(!tunnelState?.running&&n>2)return;
+    if(n<limit)tunnelPoll=setTimeout(tick,1500);
+  };
+  tunnelPoll=setTimeout(tick,1500);
+}
+
+async function startTunnel(mode){
+  const el=document.getElementById('tunnel-token');
+  const token=el?el.value.trim():'';
+  if(mode==='token'&&!token){showToast('请先粘贴隧道 token','error');return;}
+  try{
+    tunnelState=await api('POST','/tunnel/start',{mode,token});
+    renderTunnel();
+    pollTunnel();
+    showToast('正在建立隧道…','success');
+  }catch(e){showToast('开启失败: '+e.message,'error');}
+}
+
+async function stopTunnel(){
+  if(!confirm('关闭公网访问？公网地址立即失效（本机与局域网不受影响）。'))return;
+  clearTimeout(tunnelPoll);
+  try{
+    tunnelState=await api('POST','/tunnel/stop');
+    renderTunnel();
+    showToast('已关闭公网访问','success');
+  }catch(e){showToast('关闭失败: '+e.message,'error');}
+}
+
+async function copyTunnel(){
+  const url=tunnelState?.url||'';
+  if(!url)return;
+  const key=state?.remote?.gateway?.paste?.key||'';
+  const text=`OpenAI Base URL: ${url}/v1
+Anthropic Base URL: ${url}
+API Key: ${key||'（见后台 设置 → 鉴权）'}`;
+  try{await navigator.clipboard.writeText(text);showToast('接入信息已复制','success');}
+  catch{showToast('复制失败，请手动选中地址','error');}
+}
+
 
 function renderClients(){
   const box=document.getElementById('client-list');

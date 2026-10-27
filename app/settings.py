@@ -71,6 +71,13 @@ LOG_RETENTION_DAYS = _int("ZCODE_LOG_RETENTION_DAYS", 14)
 PORT = _int("ZCODE_PORT", 3000)
 HOST = os.getenv("ZCODE_HOST", "0.0.0.0")
 
+# ── 公网隧道（cloudflared）───────────────────────────────────────────────────
+# ZCODE_TUNNEL=1：随网关启动自动建一条临时隧道（start-public.bat 用的就是它）。
+# 后台「设置 → 公网访问」里开过一次也会写进数据库，重启后照样自动开。
+TUNNEL_AUTOSTART = _bool("ZCODE_TUNNEL", False)
+# cloudflared 不在 PATH 时用这个指过去
+TUNNEL_BIN = (os.getenv("ZCODE_CLOUDFLARED") or "").strip()
+
 # ── 鉴权 ─────────────────────────────────────────────────────────────────────
 # 后台管理密码默认值，首次启动写入 data/accounts.db，之后以数据库（meta 表）为准。
 DEFAULT_ADMIN_KEY = os.getenv("ZCODE_ADMIN_KEY", "zcode")

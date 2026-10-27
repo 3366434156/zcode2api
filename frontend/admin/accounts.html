@@ -376,10 +376,10 @@ function rowHtml(a){
   const isDisabled=a.status==='disabled';
   return `<div class="acct-row${isDisabled?' is-disabled':''}" data-id="${a.id}">
     <div class="cell cred">${credCell(a)}</div>
-    <div class="cell status">${statusCell(a)}</div>
-    <div class="cell recent"><div class="recent-ts">${fmtDateSec(a.last_used_at)}</div>${tickbarHtml(a)}</div>
-    <div class="cell usage">${usageCell(a)}</div>
-    <div class="cell quota">${quotaCell(a)}</div>
+    <div class="cell status" data-label="可用状态">${statusCell(a)}</div>
+    <div class="cell recent" data-label="最近请求"><div class="recent-ts">${fmtDateSec(a.last_used_at)}</div>${tickbarHtml(a)}</div>
+    <div class="cell usage" data-label="历史用量">${usageCell(a)}</div>
+    <div class="cell quota" data-label="额度信息">${quotaCell(a)}</div>
     <div class="cell actions">${actionsCell(a)}</div>
   </div>`;
 }
