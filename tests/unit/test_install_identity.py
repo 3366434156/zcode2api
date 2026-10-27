@@ -251,12 +251,13 @@ def test_cli_add_account_schedules_install(fresh_app, monkeypatch):
 
 # ── 并发设置 ─────────────────────────────────────────────────────────────────
 class TestConcurrencySetting:
-    def test_default_2(self, fresh_app):
-        assert fresh_app.account_concurrency() == 2
+    def test_default_1(self, fresh_app):
+        """默认一账号一路：上游对「账号 × 模型」并发硬限很低（超了回 429 code 3009）。"""
+        assert fresh_app.account_concurrency() == 1
 
     def test_bad_value_falls_back(self, fresh_app):
         fresh_app.set_setting("account_concurrency", "abc")
-        assert fresh_app.account_concurrency() == 2
+        assert fresh_app.account_concurrency() == 1
 
     def test_negative_clamped(self, fresh_app):
         fresh_app.set_setting("account_concurrency", "-3")

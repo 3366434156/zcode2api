@@ -380,55 +380,77 @@ async def _dispatch(req_id, body, incoming_headers, port, provider, conv_key: st
     已达上限（store.account_concurrency，0 = 不限），跳过换下一个账号——不排队
     （流式请求可占槽位数分钟，排队会放大延迟甚至吊死客户端）。满号跳过不计入
     MAX_ACCOUNT_ATTEMPTS（只计真正进入 _try_account 的次数）。全满/无号 → 503。
+
+    模型级并发（上游 3009）：实测「上一个请求刚结束的 1–2 秒内」再发，所有账号
+    都会回 3009——那是上游按模型计的并发租约还没释放，不是账号坏了。此时直接
+    回 503 太浪费，整轮短等再来（合计最多 MODEL_BUSY_ROUNDS × MODEL_BUSY_WAIT）；
+    只有整轮失败**全部**是 3009 才这样重试，别的原因照旧立刻收口。
     """
-    tried: set[str] = set()
     limit = _limit()
-    attempts = 0
     prefer = affinity.prefer(provider, conv_key)
     # 换号原因的出口：最后一个账号为什么不可用（模型额度用尽等），503 时如实回给客户端
     reason: list[str] = [""]
 
-    while attempts < MAX_ACCOUNT_ATTEMPTS:
-        account = store.select(provider, skip_ids=tried, prefer=prefer)
-        if account is None:
-            break
-        tried.add(account.id)
-        if limit > 0 and _inflight.get(account.id, 0) >= limit:
-            logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
-            continue
-        attempts += 1
-        needs_captcha = provider == "zai" and account.uses_plan_channel()
+    for round_no in range(settings.MODEL_BUSY_ROUNDS + 1):
+        tried: set[str] = set()
+        attempts = 0
+        busy_hits = 0
 
-        slot_box: list[str | None] = [None]
-        if limit > 0:
-            _inflight[account.id] = _inflight.get(account.id, 0) + 1
-            slot_box[0] = account.id
-        try:
-            result = await _try_account(
-                req_id, account, body, incoming_headers, port, needs_captcha, slot_box,
-                reason,
-            )
-        except BaseException:
+        while attempts < MAX_ACCOUNT_ATTEMPTS:
+            account = store.select(provider, skip_ids=tried, prefer=prefer)
+            if account is None:
+                break
+            tried.add(account.id)
+            if limit > 0 and _inflight.get(account.id, 0) >= limit:
+                logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
+                continue
+            attempts += 1
+            needs_captcha = provider == "zai" and account.uses_plan_channel()
+
+            slot_box: list[str | None] = [None]
+            if limit > 0:
+                _inflight[account.id] = _inflight.get(account.id, 0) + 1
+                slot_box[0] = account.id
+            try:
+                result = await _try_account(
+                    req_id, account, body, incoming_headers, port, needs_captcha, slot_box,
+                    reason,
+                )
+            except BaseException:
+                if slot_box[0] is not None:
+                    _release_slot(slot_box[0])
+                    slot_box[0] = None
+                raise
+            if result is _NEXT_BUSY:
+                busy_hits += 1
+            if result is _NEXT_ACCOUNT or result is _NEXT_BUSY:
+                if slot_box[0] is not None:
+                    _release_slot(slot_box[0])
+                    slot_box[0] = None
+                continue
+            if isinstance(result, _Upstream):
+                affinity.remember(provider, conv_key, account.id)
+                held = slot_box[0]
+                slot_box[0] = None
+                if held is not None:
+                    result.on_close = _make_slot_releaser(held)
+                return result
             if slot_box[0] is not None:
                 _release_slot(slot_box[0])
                 slot_box[0] = None
-            raise
-        if result is _NEXT_ACCOUNT:
-            if slot_box[0] is not None:
-                _release_slot(slot_box[0])
-                slot_box[0] = None
-            continue
-        if isinstance(result, _Upstream):
-            affinity.remember(provider, conv_key, account.id)
-            held = slot_box[0]
-            slot_box[0] = None
-            if held is not None:
-                result.on_close = _make_slot_releaser(held)
             return result
-        if slot_box[0] is not None:
-            _release_slot(slot_box[0])
-            slot_box[0] = None
-        return result
+
+        # 整轮没成功：全是「模型并发已满」才值得等一下再来
+        if busy_hits and busy_hits == attempts and round_no < settings.MODEL_BUSY_ROUNDS:
+            logs.warn(
+                req_id,
+                f"模型 {body.get('model') or '-'} 都在上游并发上限内（3009），"
+                f"{settings.MODEL_BUSY_WAIT:g}s 后重试整轮"
+                f"（{round_no + 1}/{settings.MODEL_BUSY_ROUNDS}）",
+            )
+            await _sleep(settings.MODEL_BUSY_WAIT)
+            continue
+        break
 
     detail = reason[0] or "无可用账号 / 额度均已耗尽 / 并发已满"
     logs.req_err(req_id, detail)
@@ -476,6 +498,9 @@ def _make_slot_releaser(account_id: str):
 
 
 _NEXT_ACCOUNT = object()
+# 换号的另一种原因：这个账号卡的只是「模型并发」（上游 3009），等一两秒就能再用。
+# 单独一个哨兵，_dispatch 才知道整轮失败是否值得短等重来。
+_NEXT_BUSY = object()
 
 
 # fire-and-forget 后台任务强引用：事件循环对 task 只持弱引用，裸 create_task
@@ -774,7 +799,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                                  f"（上游 code {business_code or status_code} · 换号后仍无可用）")
                 if not busy:
                     _spawn_bg(_safe_refresh(account))   # 额度变了，后台刷新余额
-                return _NEXT_ACCOUNT
+                # 并发已满 ≠ 账号不可用：交给 _dispatch 决定「短等重试整轮」还是收口
+                return _NEXT_BUSY if busy else _NEXT_ACCOUNT
 
             # 验证码挑战：三形态任一命中即清池重试（不改账号状态）
             challenge = _detect_captcha_challenge(resp, text) if needs_captcha else None

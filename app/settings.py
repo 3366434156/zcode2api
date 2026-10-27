@@ -33,6 +33,13 @@ def _int(env_name: str, default: int) -> int:
         return default
 
 
+def _float(env_name: str, default: float) -> float:
+    try:
+        return float(os.getenv(env_name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _bool(env_name: str, default: bool) -> bool:
     raw = (os.getenv(env_name) or "").strip().lower()
     if not raw:
@@ -153,8 +160,18 @@ RISK_STRIKE_DECAY_SECONDS = _int("ZCODE_RISK_STRIKE_DECAY_SECONDS", 7 * 86400)
 RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
 # 风控升级禁用时自动换发设备指纹（新 SKU + 新 device_mid）并后台补跑安装序
 # ——「风控后换设备重生」语义自动化，账号重新启用时即全新身份
-# 单账号并发上限（0 = 不限）。默认 2；运行期可在后台设置改（meta 表即时生效）
-ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 2)
+# 单账号并发上限（0 = 不限）。默认 1：上游对「账号 × 模型」的并发硬限很低——
+# 实测同一账号同一模型一路还在跑时再发第二路，直接回
+# 429 {"code":3009,"msg":"model concurrency limit exceeded"}。设 1 让网关自己
+# 跳号（不排队、不惊动上游），并发能力因此等于账号数（4 个号 = 4 路）。
+# 运行期可在后台设置改（meta 表即时生效）
+ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 1)
+# 模型级并发（上游 429 + code 3009「model concurrency limit exceeded」）：实测
+# **上一个请求刚结束的 1–2 秒内**再发，所有账号都会回 3009——那是上游按模型计的
+# 并发租约还没释放，不是账号坏了。整轮只因为这个原因失败时，短等再来而不是直接
+# 回 503（合计最多 ROUNDS × WAIT 秒，客户端完全等得起）
+MODEL_BUSY_WAIT = _float("ZCODE_MODEL_BUSY_WAIT", 1.0)
+MODEL_BUSY_ROUNDS = _int("ZCODE_MODEL_BUSY_ROUNDS", 3)
 # ── 流式保活 / 会话粘性（对齐 magpie 的 keepHeldAfter 与 affinity）────────────
 # SSE 心跳：客户端空闲超过该秒数就补一条注释帧 `: keep-alive`。模型思考阶段
 # 上游可能长时间只发 thinking 事件，没有心跳客户端只会显示「未响应」。
@@ -197,7 +214,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.6.9"
+APP_VERSION = "2.6.10"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 

@@ -122,7 +122,7 @@ client → 鉴权 → [循环: attempt ≤ MAX_ACCOUNT_ATTEMPTS=5]
    JWT+Key：INVALID/DISABLED 仍可选，对话走 api.z.ai 回退；纯 apiKey 不可再选。
 ```
 
-参数：`MAX_ACCOUNT_ATTEMPTS=5`、`COOLING_SECONDS=300`（仅 5xx/连接失败）、`RETRY_429_TIMES=5`、`ACCOUNT_CONCURRENCY=2`（0 = 不限）。额度耗尽由后台 `quota` 刷新探测恢复，没有独立 `exhausted_retry_seconds`。
+参数：`MAX_ACCOUNT_ATTEMPTS=5`、`COOLING_SECONDS=300`（仅 5xx/连接失败）、`RETRY_429_TIMES=5`、`ACCOUNT_CONCURRENCY=1`（0 = 不限；上游对「账号 × 模型」并发硬限很低，超了回 429 code 3009，一账号一路最稳）。额度耗尽由后台 `quota` 刷新探测恢复，没有独立 `exhausted_retry_seconds`。
 
 ### 4.3 额度监控
 

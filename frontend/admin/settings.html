@@ -44,18 +44,18 @@
     </div>
     <div class="settings-row">
       <label>额度刷新间隔（秒）</label>
-      <div class="hint">后台自动刷新各账号额度与状态的周期。设为 0 关闭自动刷新（仍可手动刷新）。修改后即时生效。</div>
-      <input class="input" id="quota-interval" type="number" min="0" step="5" placeholder="60">
+      <div class="hint">后台自动刷新各账号额度与状态的周期（默认 1800 秒 = 30 分钟；billing 查询本身是上游风控信号源，别调太小）。设为 0 关闭自动刷新（仍可手动刷新）。修改后即时生效。</div>
+      <input class="input" id="quota-interval" type="number" min="0" step="5" placeholder="1800">
     </div>
     <div class="settings-row">
       <label>单账号并发上限</label>
-      <div class="hint">每个账号同时处理的最大请求数；某账号并发满时自动切下一个账号。设为 0 不限制。修改后即时生效。</div>
-      <input class="input" id="account-concurrency" type="number" min="0" step="1" placeholder="2">
+      <div class="hint">每个账号同时处理的最大请求数；某账号并发满时自动切下一个账号。默认为 1（上游对「账号 × 模型」并发硬限很低，超了会回 429 code 3009），并发能力因此等于账号数。设为 0 不限制。修改后即时生效。</div>
+      <input class="input" id="account-concurrency" type="number" min="0" step="1" placeholder="1">
     </div>
     <div class="settings-row">
       <label>套餐自动领取轮（秒）</label>
-      <div class="hint">周期对全部 JWT 账号执行活动套餐领取（激活上报 + 查询 + 领取）。设为 0 关闭轮次，仅入池/手动触发。默认 600（10 分钟）。修改后即时生效。</div>
-      <input class="input" id="claim-round-interval" type="number" min="0" step="30" placeholder="600">
+      <div class="hint">周期对全部 JWT 账号执行活动套餐领取（激活上报 + 查询 + 领取）。设为 0 关闭轮次，仅入池/手动触发。默认 3600（1 小时）。修改后即时生效。</div>
+      <input class="input" id="claim-round-interval" type="number" min="0" step="30" placeholder="3600">
     </div>
     <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px">
       <button onclick="saveSettings()" class="dialog-btn dialog-btn-primary">保存</button>
@@ -127,9 +127,9 @@ async function load(){
     const d=await api('GET','/settings');
     document.getElementById('admin-key').value=d.admin_key_masked||'';
     document.getElementById('gateway-key').value=d.gateway_key_masked||'';
-    document.getElementById('quota-interval').value=d.quota_refresh_interval??60;
-    document.getElementById('account-concurrency').value=d.account_concurrency??2;
-    document.getElementById('claim-round-interval').value=d.claim_round_interval??600;
+    document.getElementById('quota-interval').value=d.quota_refresh_interval??1800;
+    document.getElementById('account-concurrency').value=d.account_concurrency??1;
+    document.getElementById('claim-round-interval').value=d.claim_round_interval??3600;
     const hint=document.getElementById('admin-key-default-hint');
     if(hint) hint.style.display=d.admin_key_is_default?'block':'none';
   }catch(e){showToast('加载失败: '+e.message,'error');}

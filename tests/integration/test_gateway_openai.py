@@ -30,6 +30,21 @@ def _bind_of(secret: str) -> str:
     return secret[:16]
 
 
+def _set_sequence(mock, secret: str, sequence: list[str]) -> None:
+    """给某凭证排场景队列，并把该凭证的调用计数清零。
+
+    mock 是会话级实例：counters 跨用例累加，不清零的话场景队列会直接落在
+    最后一个元素上（前面的排期永远轮不到）。
+    """
+    bind = _bind_of(secret)
+    mock.state.counters[bind] = 0
+    mock.state.sequences[bind] = sequence
+
+
+def _clear_sequence(mock, secret: str) -> None:
+    mock.state.sequences.pop(_bind_of(secret), None)
+
+
 @pytest.mark.integration
 class TestUpstreamBusinessError:
     """上游「HTTP 200 + body 里的 code」不得被当成成功。"""
@@ -40,21 +55,22 @@ class TestUpstreamBusinessError:
         from tests.conftest import seed_account
 
         seed_account(fresh_app, _GOOD_JWT, name="biz-quota")
-        mock.state.sequences[_bind_of(_GOOD_JWT)] = ["business_quota_200"]
+        _set_sequence(mock, _GOOD_JWT, ["business_quota_200"])
         try:
             res = await client.post(
                 "/v1/chat/completions",
                 json={"model": "glm-5.3", "messages": [{"role": "user", "content": "hi"}]},
             )
         finally:
-            mock.state.sequences.pop(_bind_of(_GOOD_JWT), None)
+            _clear_sequence(mock, _GOOD_JWT)
         assert res.status_code == 503
         assert "额度" in res.json()["error"]["message"]
 
     async def test_concurrency_limit_rotates_without_waiting(self, gateway_client, fresh_app,
                                                              monkeypatch):
-        """code 3009 是并发已满：换号即可，不能原地等 60s 把客户端吊住。"""
+        """code 3009 是「模型并发租约没释放」：短等重试整轮，而不是原地等 60s。"""
         client, mock = gateway_client
+        from app import settings as settings_module
         from app.routes import gateway as gateway_module
         from tests.conftest import seed_account
 
@@ -64,18 +80,49 @@ class TestUpstreamBusinessError:
             waited.append(seconds)
 
         monkeypatch.setattr(gateway_module, "_sleep", fake_sleep)
+        monkeypatch.setattr(settings_module, "MODEL_BUSY_WAIT", 1.0)
+        monkeypatch.setattr(settings_module, "MODEL_BUSY_ROUNDS", 2)
         seed_account(fresh_app, _GOOD_JWT, name="biz-3009")
-        mock.state.sequences[_bind_of(_GOOD_JWT)] = ["business_concurrency_429"]
+        # 第一轮 3009，第二轮就成功：证明「等 1s 再来」这一手确实能接上
+        _set_sequence(mock, _GOOD_JWT, ["business_concurrency_429", "ok"])
         try:
             res = await client.post(
                 "/v1/chat/completions",
                 json={"model": "glm-5.3", "messages": [{"role": "user", "content": "hi"}]},
             )
         finally:
-            mock.state.sequences.pop(_bind_of(_GOOD_JWT), None)
+            _clear_sequence(mock, _GOOD_JWT)
+        assert res.status_code == 200
+        assert waited == [1.0]        # 只等了一轮 1s，没进入 429 的 60s 等待
+
+    async def test_concurrency_gives_up_after_rounds(self, gateway_client, fresh_app,
+                                                     monkeypatch):
+        """一直 3009 时按轮数收口：不会无限等，503 里说明原因。"""
+        client, mock = gateway_client
+        from app import settings as settings_module
+        from app.routes import gateway as gateway_module
+        from tests.conftest import seed_account
+
+        waited: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            waited.append(seconds)
+
+        monkeypatch.setattr(gateway_module, "_sleep", fake_sleep)
+        monkeypatch.setattr(settings_module, "MODEL_BUSY_WAIT", 1.0)
+        monkeypatch.setattr(settings_module, "MODEL_BUSY_ROUNDS", 1)
+        seed_account(fresh_app, _GOOD_JWT, name="biz-3009-stuck")
+        _set_sequence(mock, _GOOD_JWT, ["business_concurrency_429"])
+        try:
+            res = await client.post(
+                "/v1/chat/completions",
+                json={"model": "glm-5.3", "messages": [{"role": "user", "content": "hi"}]},
+            )
+        finally:
+            _clear_sequence(mock, _GOOD_JWT)
         assert res.status_code == 503
         assert "并发" in res.json()["error"]["message"]
-        assert waited == []           # 一次都没进入 429 等待
+        assert waited == [1.0]        # 只等了一轮就收口
 
 
 
@@ -297,3 +344,4 @@ class TestChatCompletions:
             assert res.status_code == 503  # 鉴权通过，进入调度（无账号）
         finally:
             fresh_app.set_setting("gateway_key", "")
+

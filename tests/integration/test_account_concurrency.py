@@ -1,4 +1,8 @@
-"""账号并发限制集成测试（2026-09-13）：单账号默认 2，可配置，0 = 不限。
+"""账号并发限制集成测试（2026-09-13）：单账号默认 1，可配置，0 = 不限。
+
+默认 1 的原因：上游对「账号 × 模型」并发硬限很低，超了直接回
+`429 {"code":3009,"msg":"model concurrency limit exceeded"}`（2026-10-27 实测），
+所以网关自己一账号一路、满号跳下一个，并发能力 = 账号数。
 
 依赖 mock 上游 slow 场景（0.3s 延迟）制造重叠；用 conc_max 仪表（按凭证）
 断言单账号同时刻在飞请求数不超过限制。
@@ -42,8 +46,9 @@ class TestAccountConcurrency:
         mock.state.conc_max = {}
 
     async def test_single_account_limits_to_two(self, gateway_client, fresh_app):
-        """单账号 4 并发：恰 2 成功，其余 503；单号 max_concurrent ≤ 2。"""
+        """单号上限 2、4 并发：恰 2 成功，其余 503；单号 max_concurrent ≤ 2。"""
         client, mock = gateway_client
+        fresh_app.set_setting("account_concurrency", "2")
         acc = _seed(fresh_app, "hC.eyJzdWIiOiJjIn0.sig", "a-cc")
 
         async with asyncio.TaskGroup() as tg:
@@ -54,8 +59,9 @@ class TestAccountConcurrency:
         assert _per_key_max(mock, acc.jwt_token[:16]) <= 2
 
     async def test_two_accounts_all_succeed(self, gateway_client, fresh_app):
-        """双账号 4 并发：每号 ≤2，全部成功。"""
+        """双账号、每号上限 2、4 并发：每号 ≤2，全部成功。"""
         client, mock = gateway_client
+        fresh_app.set_setting("account_concurrency", "2")
         a = _seed(fresh_app, "hC.eyJzdWIiOiJjIn0.sig", "a-cc1")
         b = _seed(fresh_app, "hD.eyJzdWIiOiJkIn0.sig", "b-cc2")
 
@@ -70,6 +76,7 @@ class TestAccountConcurrency:
     async def test_full_account_skips_to_next(self, gateway_client, fresh_app):
         """A 号满 2 → 调度跳到 B 号，第 3 个请求不 503。"""
         client, _mock = gateway_client
+        fresh_app.set_setting("account_concurrency", "2")
         _seed(fresh_app, "hC.eyJzdWIiOiJjIn0.sig", "a-full")
         _seed(fresh_app, "hD.eyJzdWIiOiJkIn0.sig", "b-full")
 
@@ -105,8 +112,9 @@ class TestAccountConcurrency:
         assert statuses == [200, 503]
         assert _per_key_max(mock, acc.jwt_token[:16]) <= 1
 
-    def test_env_default_is_two(self):
-        assert settings.ACCOUNT_CONCURRENCY == 2
+    def test_env_default_is_one(self):
+        """默认一账号一路（上游 3009 模型并发硬限）。"""
+        assert settings.ACCOUNT_CONCURRENCY == 1
 
     async def test_429_wait_does_not_hold_concurrency_slot(
         self, gateway_client, fresh_app, monkeypatch
