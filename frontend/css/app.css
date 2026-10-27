@@ -278,7 +278,7 @@ select.input option{background:var(--panel);color:var(--ink)}
 .mon-tab.active .mon-tab-count{background:rgba(0,0,0,.18)}
 .mon-head,.mon-row{display:grid;gap:12px;align-items:center;padding:9px 16px}
 /* 明细表：13 列（时间/账号/模型/结果/码/首字/生成/总耗时/输入/命中/输出/tok·s/内容） */
-.mon-grid-detail{grid-template-columns:108px 118px 108px 104px 40px 58px 58px 66px 66px 54px 66px 54px minmax(180px,1fr)}
+.mon-grid-detail{grid-template-columns:100px 116px 104px 116px 38px 56px 56px 64px 64px 52px 64px 52px minmax(170px,1fr)}
 .mon-grid-live{grid-template-columns:100px 118px 108px 104px 58px 58px 66px 66px 66px 54px minmax(180px,1fr)}
 .mon-grid-agg{grid-template-columns:minmax(140px,1.2fr) 76px 64px 84px 84px 84px 84px 64px 130px}
 .mon-head{font-size:11px;font-weight:600;color:var(--ink-mute);letter-spacing:.04em;border-bottom:1px solid var(--hairline-soft)}
@@ -292,7 +292,7 @@ select.input option{background:var(--panel);color:var(--ink)}
 .mon-time{font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:11px;color:var(--ink-mute);white-space:nowrap}
 .mon-preview{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink-mute)}
 .mon-preview .err-line{color:var(--red)}
-.mon-stream{display:inline-block;margin-left:4px;padding:0 5px;border-radius:4px;font-size:10px;background:rgba(109,168,232,.14);color:#6da8e8;font-weight:600}
+.mon-stream{display:inline-block;margin-left:4px;padding:0 5px;border-radius:4px;font-size:10px;background:rgba(109,168,232,.14);color:#6da8e8;font-weight:600;white-space:nowrap;vertical-align:middle;cursor:help}
 .mon-muted{color:var(--ink-mute);font-weight:400}
 .tier-b.jwt{background:rgba(109,200,184,.16);color:#6dc8b8}
 

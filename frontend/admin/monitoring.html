@@ -134,6 +134,17 @@ function outcomeBadge(outcome, status){
   return `<span class="badge ${cls}">${label}</span>`;
 }
 
+/* 请求形态标记：流式 = 客户端要 SSE（请求体 "stream": true）。
+   它只说明「协议形态」，与成功/失败无关：失败原因看「码」和右侧文字。
+   流式才有首字；非流式的「生成」列退化为总耗时，tok/s 是端到端吞吐。 */
+const STREAM_TITLE = '客户端要求流式返回（SSE，请求体 "stream": true）\n'
+  + '· 首字 = 第一个内容块离开网关的时刻\n'
+  + '· 生成 = 末块 − 首块，tok/s 按这个窗口算\n'
+  + '非流式：首字无意义（—），生成 = 整段调用耗时';
+function streamTag(stream){
+  return stream ? `<span class="mon-stream" title="${STREAM_TITLE}">流式</span>` : '';
+}
+
 function statusCell(e){
   if(e.outcome==null && e.ok===null)return `<span class="badge badge-cooling">进行中</span>`;
   const outcome = e.outcome || (e.ok ? 'completed' : 'failed');
@@ -181,7 +192,7 @@ function renderDetail(){
       <span class="mon-time">${fmtTs(e.ts)}</span>
       <span class="mon-name" title="${esc(e.account||'')}">${esc(e.account||'—')}${e.mode?` <span class="tier-b ${e.mode==='jwt'?'jwt':'other'}">${e.mode==='jwt'?'JWT':'KEY'}</span>`:''}</span>
       <span class="mon-model" title="${esc(e.model||'')}${e.requested_model?` (请求 ${esc(e.requested_model)})`:''}">${esc(e.model||'—')}</span>
-      <span>${outcomeBadge(e.outcome, e.http_status)}${e.stream?'<span class="mon-stream">流</span>':''}</span>
+      <span>${outcomeBadge(e.outcome, e.http_status)}${streamTag(e.stream)}</span>
       <span class="mon-num">${e.http_status??'—'}</span>
       <span class="mon-num">${fmtMs(e.ttft_ms)}</span>
       <span class="mon-num">${fmtMs(e.gen_ms)}</span>
@@ -251,7 +262,7 @@ function renderLive(){
       <span class="mon-num">${fmtTok(e.input_tokens)}</span>
       <span class="mon-num" title="命中 ${hit}">${fmtTok(e.output_tokens)}</span>
       <span class="mon-num">${fmtTps(tps)}</span>
-      <span class="mon-preview" title="${esc(e.error||e.preview||'')}">${e.ok===false&&e.error?`<span class="err-line">${esc(e.error)}</span>`:esc(e.preview||'—')}${e.stream?' <span class="mon-stream">流</span>':''}</span>
+      <span class="mon-preview" title="${esc(e.error||e.preview||'')}">${e.ok===false&&e.error?`<span class="err-line">${esc(e.error)}</span>`:esc(e.preview||'—')}${e.stream?' '+streamTag(true):''}</span>
     </div>`;
   }).join('');
   $('list').innerHTML = list.length
