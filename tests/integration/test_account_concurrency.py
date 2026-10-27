@@ -159,13 +159,21 @@ class TestAccountConcurrency:
         fresh_app.set_sticky_account("zai", a.id)
         gw._inflight[a.id] = 1
         gw._slot_waiters.clear()
+        # 前置条件：粘号候选必须真的是 A（不成立的话这条用例测的就不是粘号等待了）
+        assert gw._sticky_prefer("zai") == a.id, (
+            f"sticky_account={fresh_app.sticky_account('zai')!r} a.id={a.id!r} "
+            f"enabled={fresh_app.account_sticky_enabled()}")
+
+        # 先让上一个用例的残留请求全部落地，再记下调用序列的起点：
+        # 否则「B 没被用过」会被别人的尾巴打成假失败（mock 是会话级共享的）。
+        await asyncio.sleep(0.6)
+        base = len(mock.state.calls)
 
         def _creds() -> set[str]:
             return {(h.get("authorization") or h.get("x-api-key") or "")
-                    for _m, p, h, _b in mock.state.calls if p.endswith("/v1/messages")}
+                    for _m, p, h, _b in mock.state.calls[base:] if p.endswith("/v1/messages")}
 
         try:
-            mock.state.calls.clear()
             task = asyncio.create_task(client.post("/v1/messages", json=_MSG_BODY))
             await asyncio.sleep(0.1)
             assert task.done() is False, "粘号满时应当排队等待，而不是立刻换号成功"

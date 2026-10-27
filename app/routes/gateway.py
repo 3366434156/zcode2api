@@ -572,6 +572,7 @@ async def _dispatch_model(req_id, body, incoming_headers, port, provider, prefer
     queue_wait_max = float(settings.QUEUE_WAIT_MAX or 0)
     queue_deadline = (time.monotonic() + queue_wait_max) if queue_wait_max > 0 else 0.0
     queue_logged = False
+    queue_since = 0.0            # 首次进入排队的时刻（0 = 没排过队）
     model_rounds = 0             # 3009 短等已用轮次
 
     while True:
@@ -601,6 +602,7 @@ async def _dispatch_model(req_id, body, incoming_headers, port, provider, prefer
                     left = queue_deadline - time.monotonic()
                     if not queue_logged:
                         queue_logged = True
+                        queue_since = time.monotonic()
                         logs.warn(
                             req_id,
                             f"粘号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），"
@@ -609,7 +611,9 @@ async def _dispatch_model(req_id, body, incoming_headers, port, provider, prefer
                     tried.discard(account.id)   # 下一轮还要能选中它
                     await _wait_slot_turn(min(left, _QUEUE_POLL))
                     continue
-                logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
+                # 排队期间每轮重扫都会再扫到这些满号：只报第一条，别把日志刷满。
+                if not queue_logged:
+                    logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
                 skipped_busy += 1
                 continue
             if prev_name and prev_name != account.name:
@@ -656,6 +660,12 @@ async def _dispatch_model(req_id, body, incoming_headers, port, provider, prefer
                 slot_box[0] = None
                 if held is not None:
                     result.on_close = _make_slot_releaser(held)
+                if queue_since:
+                    logs.ok(
+                        req_id,
+                        f"排队 {time.monotonic() - queue_since:.1f}s 后拿到并发槽"
+                        f"（{account.name}）",
+                    )
                 return result
             if slot_box[0] is not None:
                 _release_slot(slot_box[0])
@@ -682,6 +692,7 @@ async def _dispatch_model(req_id, body, incoming_headers, port, provider, prefer
                     return None
                 if not queue_logged:
                     queue_logged = True
+                    queue_since = time.monotonic()
                     logs.warn(
                         req_id,
                         f"全体账号并发已满（上限 {limit}/号），"

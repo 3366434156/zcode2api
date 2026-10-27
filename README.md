@@ -489,6 +489,8 @@ Chromium** 运行阿里云官方无痕 SDK 求出（happy-dom 伪造环境 2026-
 | `ZCODE_QUOTA_REFRESH_INTERVAL` | 1800 | 后台刷新额度间隔（秒），0 关闭 |
 | `ZCODE_COOLING_SECONDS` | 300 | 限流冷却时长（秒）|
 | `ZCODE_ACCOUNT_CONCURRENCY` | 1 | 单账号并发上限：上游对「账号 × 模型」并发硬限很低（超了回 429 code 3009），默认一账号一路，0 不限（运行时可在后台设置改，以库为准）|
+| `ZCODE_QUEUE_WAIT_MAX` | 120 | 所有账号并发都占满时排队等空位的最长秒数（任一槽释放即放行），0 = 不排队、直接 503 |
+| `ZCODE_QUEUE_MAX_WAITERS` | 16 | 同时排队的人数上限，超过直接 503（防全池卡住时请求无限堆叠）|
 | `ZCODE_CLAIM_ROUND_INTERVAL` | 3600 | 套餐自动领取轮间隔（秒），0 关闭（运行时可在后台设置改，以库为准）|
 | `ZCODE_MODEL_FALLBACK` | 开 | 模型兜底（自动换模型）总开关（运行时可在后台设置改，以库为准）|
 | `ZCODE_MODEL_FALLBACK_CHAIN` | `GLM-5.3,GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo,GLM-4.7` | 兜底模型顺序，逗号分隔（运行时可在后台设置改；空 = 不兜底）|

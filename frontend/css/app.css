@@ -25,6 +25,15 @@ a{color:inherit;text-decoration:none}
 button,input,textarea,select{font:inherit;border:none;outline:none;background:none;color:inherit}
 button{cursor:pointer}
 ::selection{background:rgba(232,163,61,.35)}
+/* 滚动条统一：系统原生滚动条在暗色面板里是一道白边，跟整页格格不入。
+   全局改成「细、无轨道底色、拇指用 hairline」，只在悬停时提亮。
+   两套写法都要：Chromium 走 ::-webkit-scrollbar，Firefox 走 scrollbar-*。 */
+*{scrollbar-width:thin;scrollbar-color:rgba(233,231,225,.16) transparent}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(233,231,225,.16);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:rgba(233,231,225,.3)}
+::-webkit-scrollbar-corner{background:transparent}
 code{font-family:var(--mono);font-size:.92em;background:var(--panel-2);border:1px solid var(--hairline);border-radius:4px;padding:1px 5px;color:var(--amber)}
 
 /* Login */

@@ -565,7 +565,9 @@ function renderRecent(){
       <span class="recent-ms">${t}</span>
     </div>`;
   }).join('');
-  $('recent-meta').textContent = `${state.live.length} 条在途/最近`;
+  $('recent-meta').textContent = rows.length < state.live.length
+    ? `最新 ${rows.length} / 共 ${state.live.length} 条`
+    : `${state.live.length} 条在途/最近`;
 }
 
 function openDetail(idx){

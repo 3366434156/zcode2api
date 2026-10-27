@@ -250,7 +250,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.0"
+APP_VERSION = "2.9.1"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 
@@ -265,5 +265,6 @@ def frontend_version() -> str:
         return v or APP_VERSION
     except OSError:
         return APP_VERSION
+
 
 

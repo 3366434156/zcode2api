@@ -60,8 +60,8 @@
 
 .panel{background:var(--panel);border:1px solid var(--hairline);border-radius:12px;margin-bottom:16px;
   overflow:hidden}
-.phead{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--hairline-soft);
-  flex-wrap:wrap}
+.phead{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--hairline-soft);
+  flex-wrap:wrap;min-height:46px}   /* 定高：有没有分段控件，两栏的标题区都一样高 */
 .phead h2{font-family:var(--font-serif);font-size:14.5px;font-weight:600;letter-spacing:.02em;margin:0}
 .phead .hint{font-size:11.5px;color:var(--ink-mute)}
 .phead .spacer{flex:1}
@@ -69,20 +69,25 @@
 .chartbox{position:relative}
 .chartbox canvas{width:100%;display:block}
 
-/* 最近请求：紧凑活动流 */
-.recent-list{display:flex;flex-direction:column;gap:1px;max-height:196px;overflow-y:auto}
-.recent-item{display:grid;grid-template-columns:10px 62px minmax(60px,1fr) minmax(70px,1.1fr) 56px;
-  gap:8px;align-items:center;padding:5px 4px;border-radius:5px;font-size:11.5px;color:var(--ink-dim)}
+/* 最近请求：紧凑活动流。
+   高度与左侧「Token 时序」的 canvas（176px）对齐，两栏底部齐平；行距比表格更紧，
+   因为它是个「滚动流」而不是数据表。 */
+.recent-list{display:flex;flex-direction:column;gap:0;height:176px;overflow-y:auto;
+  padding-right:4px}
+.recent-item{display:grid;grid-template-columns:8px 54px minmax(56px,1fr) minmax(64px,1.05fr) 50px;
+  gap:8px;align-items:center;padding:3px 4px;border-radius:5px;font-size:11px;color:var(--ink-dim);
+  line-height:1.45}
 .recent-item:hover{background:var(--panel-2)}
-.recent-dot{width:7px;height:7px;border-radius:50%;display:block}
+.recent-dot{width:6px;height:6px;border-radius:50%;display:block}
 .recent-dot.ok{background:var(--mint)}
 .recent-dot.bad{background:var(--red)}
 .recent-dot.run{background:var(--amber);box-shadow:0 0 0 2px rgba(232,163,61,.22)}
-.recent-time{font-family:var(--mono);font-size:11px;color:var(--ink-mute)}
+.recent-time{font-family:var(--mono);font-size:10.5px;color:var(--ink-mute);font-variant-numeric:tabular-nums}
 .recent-acct{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.recent-model{font-family:var(--mono);font-size:11px;color:var(--ink-mute);overflow:hidden;
+.recent-model{font-family:var(--mono);font-size:10.5px;color:var(--ink-mute);overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
-.recent-ms{font-family:var(--mono);font-size:11px;text-align:right;color:var(--ink-mute)}
+.recent-ms{font-family:var(--mono);font-size:10.5px;text-align:right;color:var(--ink-mute);
+  font-variant-numeric:tabular-nums}
 .recent-list .empty{font-size:12px;color:var(--ink-mute);padding:8px 4px}
 
 /* ── 工作回溯热力图 ───────────────────────────────────────────────────── */

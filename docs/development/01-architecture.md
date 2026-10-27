@@ -136,7 +136,9 @@ client → 鉴权 → [第一层 换模型：modelpool.candidates(provider, requ
    JWT+Key：INVALID/DISABLED 仍可选，对话走 api.z.ai 回退；纯 apiKey 不可再选。
 ```
 
-参数：`MAX_ACCOUNT_ATTEMPTS=5`、`COOLING_SECONDS=300`（仅 5xx/连接失败）、`RETRY_429_TIMES=5`、`ACCOUNT_CONCURRENCY=1`（0 = 不限；上游对「账号 × 模型」并发硬限很低，超了回 429 code 3009，一账号一路最稳）、`MODEL_FALLBACK_TTL=600`（模型判死冷却秒数，0 = 不跳过）。额度耗尽由后台 `quota` 刷新探测恢复，没有独立 `exhausted_retry_seconds`。
+参数：`MAX_ACCOUNT_ATTEMPTS=5`、`COOLING_SECONDS=300`（仅 5xx/连接失败）、`RETRY_429_TIMES=5`、`ACCOUNT_CONCURRENCY=1`（0 = 不限；上游对「账号 × 模型」并发硬限很低，超了回 429 code 3009，一账号一路最稳）、`MODEL_FALLBACK_TTL=600`（模型判死冷却秒数，0 = 不跳过）。
+
+并发排队（2026-10-28）：某账号满号时换下一个；**一圈扫下来每个号都在飞**才排队等任一槽释放（`QUEUE_WAIT_MAX=120s`，0 = 不排队直接 503），排队人数超过 `QUEUE_MAX_WAITERS=16` 立即 503。等待是挂 future 等唤醒（`_release_slot` 即时叫醒），不是轮询；超时/排满的 503 原因会写明「排队超时 / 排队已满」，与真正的故障区分。粘号（会话粘性 / 全局粘号）在飞时优先等它而不是换号，保持上游前缀缓存命中。额度耗尽由后台 `quota` 刷新探测恢复，没有独立 `exhausted_retry_seconds`。
 
 ### 4.3 额度监控
 
