@@ -177,33 +177,26 @@ allow-firewall.bat remove   :: 撤销这两条规则
 真正要解决的是三件事——可达性（家用宽带多为 NAT / CGNAT，外网连不进来）、TLS（裸 HTTP 会把 API Key
 和后台口令明文暴露）、鉴权（`/admin` 是整台机器的控制面）。
 
-### 方案 A：Cloudflare Tunnel（推荐，无需公网 IP，穿透 NAT）
+### 一键开启（Cloudflare 隧道，已内置）
 
-临时试用，跑起来会打印一个 `https://xxx.trycloudflare.com` 地址，关掉即失效：
+网关自带隧道管理，不需要公网 IP、不用在路由器上开端口，也不用另开一个 cloudflared 窗口：
 
-```bat
-set ZCODE_HOST=127.0.0.1
-cloudflared tunnel --url http://127.0.0.1:3000
-```
+- **双击 `start-public.bat`**：等同平时的启动脚本，只是额外让网关自己拉起一条临时隧道。
+  几秒后控制台出现 `[+] tunnel 公网地址已就绪：https://xxxx.trycloudflare.com`。
+- 或者正常启动网关，在**设置 → 公网访问**点「一键开启公网访问」：页面直接给出公网地址、
+  OpenAI / Anthropic 端点，并可一键复制成「粘三样」发给对方。
+- 临时地址是随机域名，**随进程变化、网关关闭即失效**；开过一次会写进数据库，下次启动自动重开
+  （想常驻就用下面的固定域名）。
+- 开启时会检查：后台口令是否还是默认值、网关 Key 是否为空——任一命中就在卡片上红字提醒。
 
-固定域名（需要自己的域名托管在 Cloudflare）：
+固定域名（需要域名托管在 Cloudflare）：控制台建隧道 → 复制 token → 粘进「公网访问 → 固定域名」，
+Public Hostname 指向 `http://127.0.0.1:3000`。等价的手动命令：
 
 ```bat
 cloudflared tunnel login
 cloudflared tunnel create zcode
 cloudflared tunnel route dns zcode gw.example.com
-cloudflared service install        :: 注册成 Windows 服务，开机自启
-```
-
-`%USERPROFILE%\.cloudflared\config.yml` 写入口规则（`<TUNNEL_ID>` 用 create 时打印的那个）：
-
-```yaml
-tunnel: <TUNNEL_ID>
-credentials-file: C:\Users\<你>\.cloudflared\<TUNNEL_ID>.json
-ingress:
-  - hostname: gw.example.com
-    service: http://127.0.0.1:3000
-  - service: http_status:404
+cloudflared tunnel run --token <token>
 ```
 
 - 隧道是**本机出站**连接，所以可以把 `ZCODE_HOST` 设成 `127.0.0.1`，再 `allow-firewall.bat remove`
@@ -211,13 +204,18 @@ ingress:
 - cloudflared 会注入 `CF-Connecting-IP`，`app/auth_admin.py` 优先读它，按 IP 的登录失败锁定照常生效。
 - 想再收紧后台：Cloudflare Zero Trust → Access 里给 `gw.example.com/admin*` 加一条策略（邮箱 OTP / Google 登录），
   公网就打不开后台，`/v1/*` 仍可凭网关 Key 直连。
+- 后台已做手机端适配（≤720px 头部拆两行、账号池每行改卡片、监控只留时间/账号/结果/内容），
+  手机浏览器打开公网地址就能管理账号池和看日志。
 
-### 方案 B：Tailscale（只给自己的设备）
+环境变量：`ZCODE_TUNNEL=1` 让网关启动即开临时隧道（`start-public.bat` 就是这么做的）；
+`ZCODE_CLOUDFLARED` 指定 cloudflared.exe 路径（不在 PATH 时）。
+
+### 备选 1：Tailscale（只给自己的设备）
 
 装 Tailscale 并登录，本机拿到 `100.x.y.z`；其它设备加入同一 tailnet 后直接访问
 `http://100.x.y.z:3000/admin`。不对公网暴露任何端口，源 IP 仍是真实设备 IP，限流照常按 IP 生效。
 
-### 方案 C：公网 IP + 端口映射 / VPS 反代
+### 备选 2：公网 IP + 端口映射 / VPS 反代
 
 - 有公网 IPv4：路由器把 3000 映射到本机，**务必**再套一层 HTTPS（Caddy 自动证书最省事）。
 - CGNAT（联通/移动宽带常见）拿不到公网 IP：用 VPS 跑 `frp` / `nps` 做反向代理。
@@ -244,7 +242,7 @@ ingress:
   `(http.request.uri.path contains "/admin" and not ip.src in {1.2.3.4 5.6.7.8})` → Block。
 - **Windows 防火墙白名单**：只放行固定出口 IP，最硬也最脆（对方 IP 一变就断）：
   `netsh advfirewall firewall add rule name="zcode-gw" dir=in action=allow protocol=TCP localport=3000 remoteip=1.2.3.4,5.6.7.8`
-- **绑定 127.0.0.1 + 隧道**（见方案 A）：源站不出公网，只能走隧道，绕不过 CDN 上的规则。
+- **绑定 127.0.0.1 + 隧道**（见上方「一键开启」）：源站不出公网，只能走隧道，绕不过 CDN 上的规则。
 
 > Cloudflare 的 Rate Limiting 规则属付费版（Pro 起）；免费版靠 Access + WAF 已足够挡扫描器。
 

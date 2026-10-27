@@ -31,6 +31,10 @@ from .store import store
 
 # 临时隧道域名（quick tunnel）：https://<随机词>.trycloudflare.com
 _QUICK_RE = re.compile(r"https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com")
+# cloudflared 的日志级别是行内 token（"…Z ERR precheck …"）。只认 ERR/FTL：
+# quick 隧道起手会打 "UDP Connectivity … status=fail" 这类 INF 预检噪音，
+# 按关键字 "failed" 匹配会把正常连接记成错误。
+_ERR_RE = re.compile(r"\b(ERR|FTL)\b")
 
 # Windows 上没有控制台窗口：.bat 启动的 python 是控制台程序，再拉一个带窗口的
 # 子进程会多出一个黑框，用户关错窗口就把隧道关了。
@@ -49,6 +53,7 @@ class _Tunnel:
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._desired = False
+        self._running = False
         self._mode = ""
         self._url = ""
         self._error = ""
@@ -80,8 +85,10 @@ class _Tunnel:
     # ── 状态 ─────────────────────────────────────────────────────────────────
     def status(self) -> dict:
         with self._lock:
-            proc = self._proc
-            running = bool(proc and proc.poll() is None)
+            # 用 _running（「用户要它在跑」且后台线程还活着），而不是
+            # proc.poll()：spawn 到 cloudflared 真正建立连接之间有几秒，
+            # 那段时间按 proc 判断会让界面闪回「未开启」。
+            running = bool(self._running)
             data = {
                 "available": bool(self.binary()),
                 "binary": self.binary(),
@@ -133,7 +140,7 @@ class _Tunnel:
                 raise TunnelError("token 模式需要在 Cloudflare 控制台建隧道后填入 token")
 
         with self._lock:
-            if self._proc and self._proc.poll() is None:
+            if self._running and self._proc and self._proc.poll() is None:
                 return self.status()
             if persist:
                 store.set_setting("tunnel_mode", mode)
@@ -147,6 +154,7 @@ class _Tunnel:
             self._restarts = 0
             self._tail.clear()
             self._desired = True
+            self._running = True
             self._thread = threading.Thread(target=self._loop, name="cloudflared", daemon=True)
             self._thread.start()
         logs.step("tunnel", f"正在建立公网隧道（{mode}）…")
@@ -155,6 +163,7 @@ class _Tunnel:
     def stop(self, persist: bool = True) -> dict:
         with self._lock:
             self._desired = False
+            self._running = False
             proc = self._proc
             self._proc = None
             self._url = ""
@@ -190,6 +199,15 @@ class _Tunnel:
 
     def _loop(self) -> None:
         delay = 3.0
+        try:
+            self._loop_body(delay)
+        finally:
+            # 线程是唯一知道「已经彻底不跑了」的地方：由它收尾，status() 才能
+            # 如实回报 running=False（start/stop 改的都是意愿，不是事实）。
+            with self._lock:
+                self._running = False
+
+    def _loop_body(self, delay: float) -> None:
         while True:
             with self._lock:
                 if not self._desired:
@@ -197,6 +215,7 @@ class _Tunnel:
                 binary = self.binary()
                 if not binary:
                     self._error = "cloudflared 不见了"
+                    self._desired = False
                     return
             try:
                 proc = subprocess.Popen(
@@ -212,6 +231,7 @@ class _Tunnel:
             except OSError as err:
                 with self._lock:
                     self._error = f"启动 cloudflared 失败：{err}"
+                    self._desired = False
                 logs.err("tunnel", self._error)
                 return
 
@@ -236,6 +256,7 @@ class _Tunnel:
                 self._restarts += 1
                 if self._restarts > _MAX_RESTARTS:
                     self._error = f"隧道连续退出（code {code}），已停止重试"
+                    self._desired = False
                     logs.err("tunnel", self._error)
                     return
                 self._error = f"隧道进程退出（code {code}），{delay:.0f}s 后重连"
@@ -265,7 +286,7 @@ class _Tunnel:
             if first_seen:
                 got = True
                 logs.ok("tunnel", f"公网地址已就绪：{first_seen}")
-            elif any(k in line for k in ("ERR", "error", "failed", "Failed")):
+            elif _ERR_RE.search(line):
                 with self._lock:
                     self._error = line[:300]
         return got

@@ -43,3 +43,15 @@
 .log-line.lv-error .log-msg{color:#f3b3b3}
 .log-line.lv-warn .log-msg{color:#e8d5a8}
 .log-empty{padding:48px 24px;text-align:center;color:var(--terminal-dim);font-size:13px}
+
+/* 手机端：工具栏按「筛选 → 统计 → 操作」纵向堆叠，终端视窗改成视口高度，
+   否则 620px 的固定高度在手机上要么看不到底、要么整页滚两遍。 */
+@media (max-width:720px){
+  .logs-toolbar{gap:8px;padding:9px 10px}
+  .logs-search{flex:1 1 100%;order:5;min-width:0}
+  .logs-stats{order:4;font-size:11px}
+  .terminal-body{height:58vh;min-height:280px;padding:8px 10px}
+  .log-line{font-size:11px;gap:6px;padding:3px 2px}
+  .log-level{width:auto}
+  .terminal-title{max-width:42vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+}

@@ -447,9 +447,27 @@ select.input option{background:var(--panel);color:var(--ink)}
   .mon-grid-detail > :nth-child(n+5):nth-child(-n+12){display:none}
   .mon-grid-live{grid-template-columns:90px 108px 96px 1fr;grid-auto-rows:auto}
   .mon-grid-live > :nth-child(n+5):nth-child(-n+10){display:none}
-  .mon-grid-agg{grid-template-columns:minmax(110px,1.2fr) 64px 64px 1fr;grid-auto-rows:auto}
+  .mon-grid-agg{grid-template-columns:minmax(110px,1.2fr) 56px 56px 56px 56px minmax(80px,1fr);grid-auto-rows:auto}
   .mon-grid-agg > :nth-child(n+5):nth-child(-n+8){display:none}
   .mon-search{width:100%}
+}
+
+/* 手机竖屏：明细/在飞只留 时间 · 账号 · 内容（模型、耗时这些点开详情看），
+   聚合表留 名称 · 调用 · 成功 · 失败，避免 6 列挤在 4 个轨道里换行错位。 */
+@media (max-width:560px){
+  .admin-main{padding-left:10px;padding-right:10px}
+  .mon-head,.mon-row{padding:8px 10px;gap:8px}
+  .mon-grid-detail{grid-template-columns:70px 92px minmax(0,1fr)}
+  .mon-grid-detail > :nth-child(3){display:none}
+  .mon-grid-live{grid-template-columns:70px 92px minmax(0,1fr)}
+  .mon-grid-live > :nth-child(3){display:none}
+  .mon-grid-agg{grid-template-columns:minmax(90px,1fr) 44px 44px 48px}
+  .mon-grid-agg > :nth-child(n+5){display:none}
+  .mon-pager{padding:10px 0 0;flex-wrap:wrap;gap:6px}
+  .mon-pager-info{margin-right:0;width:100%}
+  .mon-modal{padding:12px 10px}
+  .mon-detail-grid{grid-template-columns:minmax(0,1fr)}
+  .spark{width:100%}
 }
 
 /* 尊重系统「减少动态效果」：关掉悬停位移与缩放，只保留描边/颜色反馈 */

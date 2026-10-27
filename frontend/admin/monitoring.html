@@ -317,25 +317,33 @@ function seriesValues(metric){
 
 /* 迷你趋势线：KPI 卡下方的 sparkline（纯 canvas，不引图表库） */
 function drawSpark(id, values, danger){
-  const cv = $(id); if(!cv || !values.length) return;
+  const cv = $(id); if(!cv) return;
   const dpr = window.devicePixelRatio || 1;
   const w = cv.clientWidth || 200, h = 34;
   cv.width = w*dpr; cv.height = h*dpr;
   const ctx = cv.getContext('2d');
   ctx.scale(dpr, dpr);
   ctx.clearRect(0,0,w,h);
+  if(!values.length) return;                  // 没数据就留空，别画个假的
+  const color = danger ? 'rgba(224,82,82,' : 'rgba(232,163,61,';
+  if(values.length === 1){
+    // 单点画不出趋势：给一条基线，否则面积填充会变成斜切的三角形
+    ctx.strokeStyle = color + '.5)'; ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(0, h-3); ctx.lineTo(w, h-3); ctx.stroke();
+    return;
+  }
   const max = Math.max(...values, 1), min = Math.min(...values, 0);
   const span = max-min || 1;
-  const step = values.length>1 ? w/(values.length-1) : w;
+  const step = w/(values.length-1);
   ctx.beginPath();
   values.forEach((v,i)=>{
     const x = i*step, y = h - 2 - ((v-min)/span)*(h-4);
     i ? ctx.lineTo(x,y) : ctx.moveTo(x,y);
   });
-  ctx.strokeStyle = danger ? 'rgba(224,82,82,.85)' : 'rgba(232,163,61,.85)';
+  ctx.strokeStyle = color + '.85)';
   ctx.lineWidth = 1.6; ctx.lineJoin='round'; ctx.stroke();
   ctx.lineTo(w,h); ctx.lineTo(0,h); ctx.closePath();
-  ctx.fillStyle = danger ? 'rgba(224,82,82,.12)' : 'rgba(232,163,61,.12)';
+  ctx.fillStyle = color + '.12)';
   ctx.fill();
 }
 
