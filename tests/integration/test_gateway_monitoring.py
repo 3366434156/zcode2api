@@ -213,4 +213,6 @@ class TestMonitoringRecording:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             res = await client.get("/admin/monitoring")
         assert res.status_code == 200
-        assert "请求监控" in res.text
+        # 页面已重做成「数据看板」（workbuddy 用量看板形态）：锚定标题 + 关键卡片的槽位
+        assert "数据看板" in res.text
+        assert 'id="kpis"' in res.text and 'id="series-canvas"' in res.text

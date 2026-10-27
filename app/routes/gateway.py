@@ -444,9 +444,9 @@ async def _dispatch(req_id, body, incoming_headers, port, provider, conv_key: st
     **第二层：换号**（_dispatch_model）。选号顺序：会话粘性记住的账号优先（同一段
     对话回到同一账号，上游前缀缓存才能继续命中），否则 round-robin。单账号并发
     限制：选号后若该账号在飞请求已达上限（store.account_concurrency，0 = 不限），
-    跳过换下一个账号——不排队（流式请求可占槽位数分钟，排队会放大延迟甚至吊死
-    客户端）。满号跳过不计入 MAX_ACCOUNT_ATTEMPTS（只计真正进入 _try_account 的
-    次数）。全满/无号 → 503。
+    先换下一个账号；**一圈下来每个号都满**时不再直接 503，而是排队等任一槽释放
+    （QUEUE_WAIT_MAX，0 = 不排队）。满号跳过不计入 MAX_ACCOUNT_ATTEMPTS（只计
+    真正进入 _try_account 的次数）。无号可用 / 排队超时 / 排队已满 → 503。
 
     模型级并发（上游 3009）：实测「上一个请求刚结束的 1–2 秒内」再发，所有账号
     都会回 3009——那是上游按模型计的并发租约还没释放，不是账号坏了。此时直接
@@ -511,12 +511,54 @@ async def _dispatch(req_id, body, incoming_headers, port, provider, conv_key: st
     )
 
 
+# ── 排队：全池并发占满时等一个槽空出来 ───────────────────────────────────────
+# 请求挂在 future 上等，不占 _inflight、不碰上游连接；槽释放即时唤醒重扫。
+# 抢到槽的那一路是在同步段里 check+inc 的（asyncio 单线程），不会出现多个等待者
+# 同时拿到同一个槽。唤醒是「叫醒所有人重扫」而不是逐个分配：waiters 数量有
+# QUEUE_MAX_WAITERS 上限，重扫的开销可以忽略。
+_slot_waiters: set[asyncio.Future] = set()
+
+# 单次等待的兜底上限：唤醒是即时的，这里只防「漏唤醒」（比如释放方在别的线程）
+# 把请求永久挂住——超时醒来最多多扫一遍池子。
+_QUEUE_POLL = 5.0
+
+
+def _wake_slot_waiters() -> None:
+    while _slot_waiters:
+        fut = _slot_waiters.pop()
+        if fut.done():
+            continue
+        try:
+            fut.set_result(None)
+        except Exception:  # noqa: BLE001 - 唤醒失败由 _QUEUE_POLL 兜底
+            pass
+
+
+async def _wait_slot_turn(timeout: float) -> bool:
+    """等一个并发槽释放；返回 False 表示等满 timeout 仍无空位。"""
+    fut = asyncio.get_running_loop().create_future()
+    _slot_waiters.add(fut)
+    try:
+        await asyncio.wait_for(fut, timeout)
+        return True
+    except TimeoutError:
+        return False
+    finally:
+        _slot_waiters.discard(fut)
+        if not fut.done():
+            fut.cancel()
+
+
 async def _dispatch_model(req_id, body, incoming_headers, port, provider, prefer, conv_key,
                           reason: list[str]):
     """单个模型内的多账号轮询。
 
     返回 _Upstream / JSONResponse（其它错误直接回传）/ _NEXT_MODEL 语义的
     `_MODEL_DEAD`（整轮每个账号都是「这个模型不可用」）/ None（失败但非模型问题）。
+
+    满号处理：一圈扫下来每个号都在飞（attempts == 0 且 skipped_busy > 0）时按
+    QUEUE_WAIT_MAX 排队等槽（0 = 不排队直接返回 None → 503），排到某号空出就
+    重扫；超时或排队人数超过 QUEUE_MAX_WAITERS 才收口，原因写进 reason[0]。
     """
     limit = _limit()
     # 换号轨迹的记账本：上一个真正尝试过的账号 + 它为什么被放弃。
@@ -525,7 +567,14 @@ async def _dispatch_model(req_id, body, incoming_headers, port, provider, prefer
     prev_name = ""
     prev_why = ""
 
-    for round_no in range(settings.MODEL_BUSY_ROUNDS + 1):
+    # 排队预算：只有「一圈下来每个号都在飞」（attempts == 0 且有号被满号跳过）
+    # 才启用；计的是进入调度以来的总等待，与 3009 短等轮次互不消耗。
+    queue_wait_max = float(settings.QUEUE_WAIT_MAX or 0)
+    queue_deadline = (time.monotonic() + queue_wait_max) if queue_wait_max > 0 else 0.0
+    queue_logged = False
+    model_rounds = 0             # 3009 短等已用轮次
+
+    while True:
         tried: set[str] = set()
         attempts = 0
         busy_hits = 0
@@ -542,6 +591,24 @@ async def _dispatch_model(req_id, body, incoming_headers, port, provider, prefer
                 break
             tried.add(account.id)
             if limit > 0 and _inflight.get(account.id, 0) >= limit:
+                # 粘号在忙：**等它**而不是跳到别的号去。用户要的就是「正常情况下
+                # 一直用一个账号」——这一路请求只是排在它后面，而不是被赶到另一个
+                # 账号（那会让上游缓存换一份、后台看起来一直在跳号）。
+                # 只有粘号自己值得等：其它号满了照旧换下一个。
+                if (prefer and account.id == prefer and queue_deadline
+                        and time.monotonic() < queue_deadline
+                        and len(_slot_waiters) < settings.QUEUE_MAX_WAITERS):
+                    left = queue_deadline - time.monotonic()
+                    if not queue_logged:
+                        queue_logged = True
+                        logs.warn(
+                            req_id,
+                            f"粘号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），"
+                            f"排队等它（最多 {queue_wait_max:g}s）而不是换号",
+                        )
+                    tried.discard(account.id)   # 下一轮还要能选中它
+                    await _wait_slot_turn(min(left, _QUEUE_POLL))
+                    continue
                 logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
                 skipped_busy += 1
                 continue
@@ -595,13 +662,44 @@ async def _dispatch_model(req_id, body, incoming_headers, port, provider, prefer
                 slot_box[0] = None
             return result
 
-        # 整轮没成功：全是「模型并发已满」才值得等一下再来
-        if busy_hits and busy_hits == attempts and round_no < settings.MODEL_BUSY_ROUNDS:
+        # ① 一圈下来每个号都在飞：这不是故障，是排队信号。请求还没碰上游
+        #   （attempts == 0），挂起等任一槽释放，比 503 让客户端自己重试更好。
+        if skipped_busy and attempts == 0:
+            reason[0] = f"所有账号并发已满（上限 {limit}/号）"
+            if queue_deadline:
+                left = queue_deadline - time.monotonic()
+                if left <= 0:
+                    reason[0] = (
+                        f"所有账号并发已满（上限 {limit}/号），"
+                        f"排队 {queue_wait_max:g}s 未等到空位"
+                    )
+                    return None
+                if len(_slot_waiters) >= settings.QUEUE_MAX_WAITERS:
+                    reason[0] = (
+                        f"所有账号并发已满（上限 {limit}/号），"
+                        f"排队已满（{len(_slot_waiters)}/{settings.QUEUE_MAX_WAITERS}）"
+                    )
+                    return None
+                if not queue_logged:
+                    queue_logged = True
+                    logs.warn(
+                        req_id,
+                        f"全体账号并发已满（上限 {limit}/号），"
+                        f"排队等待空位（最多 {queue_wait_max:g}s）",
+                    )
+                # 槽释放会立刻唤醒；_QUEUE_POLL 只是漏唤醒时的兜底重扫
+                await _wait_slot_turn(min(left, _QUEUE_POLL))
+                continue
+            return None
+
+        # ② 试过的号全回 3009（模型并发租约还没释放）才值得等一下再来
+        if busy_hits and busy_hits == attempts and model_rounds < settings.MODEL_BUSY_ROUNDS:
+            model_rounds += 1
             logs.warn(
                 req_id,
                 f"模型 {body.get('model') or '-'} 都在上游并发上限内（3009），"
                 f"{settings.MODEL_BUSY_WAIT:g}s 后重试整轮"
-                f"（{round_no + 1}/{settings.MODEL_BUSY_ROUNDS}）",
+                f"（{model_rounds}/{settings.MODEL_BUSY_ROUNDS}）",
             )
             await _sleep(settings.MODEL_BUSY_WAIT)
             continue
@@ -621,6 +719,9 @@ def _release_slot(account_id: str) -> None:
         _inflight.pop(account_id, None)
     else:
         _inflight[account_id] = n
+    # 排队者只可能因为「每个号都满」在等；任一槽释放就该重扫一遍池子
+    if _slot_waiters:
+        _wake_slot_waiters()
 
 
 def _park_slot(slot_box: list[str | None] | None) -> None:

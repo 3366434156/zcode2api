@@ -96,7 +96,7 @@
     </div>
     <div class="settings-row">
       <label>单账号并发上限</label>
-      <div class="hint">每个账号同时处理的最大请求数；某账号并发满时自动切下一个账号。默认为 1（上游对「账号 × 模型」并发硬限很低，超了会回 429 code 3009），并发能力因此等于账号数。设为 0 不限制。修改后即时生效。</div>
+      <div class="hint">每个账号同时处理的最大请求数；某账号并发满时自动切下一个账号，所有账号都满时请求排队等空位（默认最多等 120s，可用环境变量 ZCODE_QUEUE_WAIT_MAX 调整，0 = 不排队直接拒绝）。默认为 1（上游对「账号 × 模型」并发硬限很低，超了会回 429 code 3009），并发能力因此等于账号数。设为 0 不限制。修改后即时生效。</div>
       <input class="input" id="account-concurrency" type="number" min="0" step="1" placeholder="1">
     </div>
     <div class="settings-row">

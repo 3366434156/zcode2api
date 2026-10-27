@@ -166,9 +166,17 @@ RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
 # 单账号并发上限（0 = 不限）。默认 1：上游对「账号 × 模型」的并发硬限很低——
 # 实测同一账号同一模型一路还在跑时再发第二路，直接回
 # 429 {"code":3009,"msg":"model concurrency limit exceeded"}。设 1 让网关自己
-# 跳号（不排队、不惊动上游），并发能力因此等于账号数（4 个号 = 4 路）。
+# 跳号（不惊动上游），并发能力因此等于账号数（4 个号 = 4 路）。
 # 运行期可在后台设置改（meta 表即时生效）
 ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 1)
+# 全池并发占满时排队等空位（秒）。账号并发 1 时「4 个号都在跑」是常态而不是
+# 故障——这时直接 503 等于把客户端顶回去自己重试。排队后任一槽释放就立刻放行，
+# 等满这个时长仍无空位才回 503（原因写明「排队超时」，监控里能和真正的故障区分）。
+# 0 = 不排队，恢复「满即 503」的旧行为。
+QUEUE_WAIT_MAX = _float("ZCODE_QUEUE_WAIT_MAX", 120.0)
+# 排队人数上限：全池卡住时防止请求无限堆叠（每个等待者都占着一条客户端连接）。
+# 超过就直接 503（原因「排队已满」），让客户端自己决定是否重试。
+QUEUE_MAX_WAITERS = _int("ZCODE_QUEUE_MAX_WAITERS", 16)
 # 全局粘号：所有会话的流量都尽量留在同一个账号上（默认开）。只有它不可用
 # （额度用完 / 冷却 / 并发满 / 凭证失效）才轮询下一个——上游按「账号 × 模型」
 # 计并发租约，摊开到多个号并不能提高并发上限，只会让后台看起来一直在跳号。
@@ -242,7 +250,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.9.0"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 
@@ -257,4 +265,5 @@ def frontend_version() -> str:
         return v or APP_VERSION
     except OSError:
         return APP_VERSION
+
 

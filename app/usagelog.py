@@ -241,7 +241,38 @@ class UsageLog:
         return row
 
     def stats(self, where: str = "", params: tuple = ()) -> dict:
-        """区间聚合：总量、成功率、时延、token、缓存命中、tok/s。"""
+        """区间聚合：总量、成功率、时延、token、缓存命中、tok/s。
+
+        where 里第一个条件固定是 `ts >= ?`（见 admin_api._usage_filter），
+        这里顺手用它做「上一等长周期」的对比查询——KPI 卡上的 ↑↓ 就靠它。
+        """
+        out = self._stats_once(where, params)
+        out["prev"] = self._prev_stats(where, params)
+        return out
+
+    def _prev_stats(self, where: str, params: tuple) -> dict:
+        """上一个等长周期的同口径聚合（拿不到就返回空 dict，前端显示「—」）。"""
+        try:
+            if not where or not params:
+                return {}
+            # where 形如 "ts >= ? AND ..."：把起点往前推一个区间长度即可
+            start = float(params[0])
+            span = max(1.0, time.time() - start)
+            prev_where = "ts >= ? AND ts < ?" + (
+                (" AND " + where.split(" AND ", 1)[1]) if " AND " in where else ""
+            )
+            prev_params = (start - span, start) + tuple(params[1:])
+            data = self._stats_once(prev_where, prev_params)
+            # 只留前端要用的几个，省得响应体翻倍
+            keep = ("calls", "ok", "fail", "input_tokens", "output_tokens",
+                    "cached_tokens", "fallback", "success_rate", "cache_hit_pct",
+                    "avg_tps", "avg_ttft_ms", "avg_gen_ms", "avg_total_ms")
+            return {k: data.get(k) for k in keep}
+        except (TypeError, ValueError, sqlite3.Error):
+            return {}
+
+    def _stats_once(self, where: str, params: tuple) -> dict:
+        """单次区间聚合（stats 与「上一周期」共用同一段 SQL，口径不可能漂）。"""
         clause = f" WHERE {where}" if where else ""
         with closing(self._connect()) as conn:
             row = conn.execute(
@@ -314,19 +345,53 @@ class UsageLog:
         return out
 
     def series(self, where: str = "", params: tuple = (), buckets: int = 24) -> list[dict]:
-        """按小时分桶的调用量 / 失败数（趋势图）。"""
+        """按小时分桶的时序（Token / 请求数 / 吞吐量，一次查全，前端切换指标不再打请求）。
+
+        `hour` 是 epoch 秒整除 3600，前端自己转本地时间——服务端不做时区假设。
+        """
         clause = f" WHERE {where}" if where else ""
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 f"""SELECT CAST(ts / 3600 AS INTEGER) AS hour,
                           COUNT(*) AS calls,
                           SUM(CASE WHEN outcome <> 'completed' THEN 1 ELSE 0 END) AS fail,
-                          SUM(COALESCE(output_tokens, 0)) AS output_tokens
+                          SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))
+                              AS tokens,
+                          SUM(COALESCE(cached_tokens, 0)) AS cached_tokens,
+                          SUM(COALESCE(output_tokens, 0)) AS output_tokens,
+                          AVG(tokens_per_sec) AS tps
                     FROM requests{clause}
                     GROUP BY hour ORDER BY hour DESC LIMIT ?""",
                 (*params, max(1, min(int(buckets), 240))),
             ).fetchall()
-        return [dict(r) for r in reversed(rows)]
+        out = []
+        for r in reversed(rows):
+            item = dict(r)
+            item["tps"] = round(item["tps"], 1) if item.get("tps") is not None else None
+            out.append(item)
+        return out
+
+    def heatmap(self, days: int = 84) -> list[dict]:
+        """最近 N 天每日请求数（看板「活动热力图」/ 年度回溯用）。
+
+        按本地日期切分：用户看到的是自己日历上的「哪一天」。
+        """
+        days = max(7, min(int(days), 370))
+        since = time.time() - days * 86400
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT CAST((ts + ?) / 86400 AS INTEGER) AS day_index,
+                          COUNT(*) AS calls,
+                          SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)) AS tokens
+                   FROM requests WHERE ts >= ? GROUP BY day_index ORDER BY day_index""",
+                (-time.timezone, since),
+            ).fetchall()
+        # day_index → 本地日期（0 点 epoch 秒），前端直接用
+        return [
+            {"day": int(r["day_index"]) * 86400 + time.timezone,
+             "calls": int(r["calls"]), "tokens": int(r["tokens"] or 0)}
+            for r in rows
+        ]
 
     def clear(self) -> int:
         with closing(self._connect()) as conn:

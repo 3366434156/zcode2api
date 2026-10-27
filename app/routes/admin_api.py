@@ -850,7 +850,8 @@ async def import_accounts(payload: dict = Body(...)):
 
 
 # ── 请求监控 ─────────────────────────────────────────────────────────────────
-_RANGE_SECONDS = {"1h": 3600, "6h": 6 * 3600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
+_RANGE_SECONDS = {"1h": 3600, "6h": 6 * 3600, "24h": 86400, "d3": 3 * 86400,
+                  "7d": 7 * 86400, "30d": 30 * 86400}
 
 
 def _range_start(range_key: str) -> float:
@@ -893,8 +894,13 @@ async def monitoring():
 
 @router.get("/usage")
 async def usage(range: str = "today", outcome: str = "all", account: str = "",
-                model: str = "", q: str = "", limit: int = 100, offset: int = 0):
-    """请求台账：分页明细 + 区间聚合（SQL 侧统计，翻页不改变口径）。"""
+                model: str = "", q: str = "", limit: int = 100, offset: int = 0,
+                heatmap_days: int = 84):
+    """请求台账（数据看板）：分页明细 + 区间聚合 + 时序 + 每日热力图。
+
+    一次请求把看板要的所有聚合都带上：KPI 卡、趋势图、维度表、热力图各自取字段，
+    前端 5 秒轮询只打这一个端点（少一轮往返，口径也天然一致）。
+    """
     usagelog.flush()   # 让刚结束的请求当场可见（写入是异步批量的）
     where, params = _usage_filter(range, outcome, account, model, q)
     rows, total = usagelog.query(where, params, limit=limit, offset=offset)
@@ -906,7 +912,9 @@ async def usage(range: str = "today", outcome: str = "all", account: str = "",
         "stats": usagelog.stats(where, params),
         "by_account": usagelog.group_by("account", where, params),
         "by_model": usagelog.group_by("model", where, params),
+        "by_endpoint": usagelog.group_by("endpoint", where, params),
         "series": usagelog.series(where, params),
+        "heatmap": usagelog.heatmap(heatmap_days),
     }
 
 
