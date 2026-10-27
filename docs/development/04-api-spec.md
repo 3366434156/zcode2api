@@ -11,6 +11,7 @@
 - 请求/响应：标准 Anthropic Messages API（含 `stream: true` 的 SSE 透传）。
 - 上游转发目标由账号模式决定：JWT → `zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`；API Key → `api.z.ai/api/anthropic/v1/messages`。
 - 行为：池内 round-robin 选号（`store.select`）→ 单账号失败按分类换号（≤`MAX_ACCOUNT_ATTEMPTS=5`，满号跳过不计）→ 验证码挑战原账号重试（≤3）。429/5xx/验证码等待期间释放该账号并发槽，醒后重新占槽或换号。
+- 模型兜底：请求模型永远先试；整轮里试过的每个账号都被上游判 1005 / 3006 时，按兜底链换到下一个模型（见 §1.4）。
 - 模型名规范化：小写化后映射（`glm-5.2→GLM-5.2`、`glm-5-turbo→GLM-5-Turbo`、`glm-turbo→GLM-5-Turbo`、`glm-5.1→GLM-5.1`、`glm-4.7→GLM-4.7`）；未知名原样透传。
 
 ### 1.2 `GET /v1/models`
@@ -25,6 +26,22 @@
 
 - 入站 OpenAI Chat 格式 → 翻译为 Anthropic 上游 → 翻译回 OpenAI 响应；`stream:true` 逐块翻译。
 - usage/tool_calls 映射规则以移植对照表为准（`openai_compat.py`）。
+- 兜底头同 §1.4；换过模型时，返回体与 SSE chunk 里的 `model` 字段是**实际服务**的模型。
+
+### 1.4 模型兜底相关头（两个网关端点通用）
+
+额度按「账号 × 模型」计，请求的模型在全池都不可用时网关会按兜底链换到下一个模型继续服务
+（设计见 `01-architecture.md` §4.1，判定口径见 `05-upstream-protocols.md` §12）。
+
+| 头 | 方向 | 说明 |
+|---|---|---|
+| `x-zcode-model` | 响应 | **实际服务**的模型；没换模型时与请求模型一致 |
+| `x-zcode-model-requested` | 响应 | 客户端原本点的模型；**只有发生过兜底才有这个头** |
+| `x-zcode-no-fallback` | 请求 | `1` / `true` / `yes` / `on` → 本次请求关闭兜底，只要请求的那个模型（`x-zcode-model-fallback: off` 同义） |
+
+- 流式（SSE）与非流式都带这两个响应头；它们不影响响应体格式。
+- 开关、兜底链、判死 TTL 用 `PUT /admin/api/settings` 改（全局）；单请求级关闭只认上面这个请求头。
+- `/v1/models` 的清单不受兜底影响：那是「客户端可以点的模型」，不是「此刻一定有额度」。
 
 ### 1.6 错误格式
 
@@ -87,10 +104,12 @@
 | 方法/路径 | 说明 |
 |-----------|------|
 | `GET /admin/api/monitoring` | 实时视图：内存环形日志（最新在前，KEEP=500，含进行中，重启清零） |
-| `GET /admin/api/usage` | 持久台账：`range`（1h/6h/24h/today/7d/30d/all）× `outcome`（all/ok/fail/completed/client_aborted/upstream_aborted/failed）× `account` / `model` / `q` × `limit`(≤500) / `offset`。返回 `rows`（明细）+ `total` + `stats`（调用/成功率/token/缓存命中/首字/tok·s）+ `by_account` + `by_model` + `series`（按小时分桶） |
+| `GET /admin/api/usage` | 持久台账：`range`（1h/6h/24h/today/7d/30d/all）× `outcome`（all/ok/fail/completed/client_aborted/upstream_aborted/failed）× `account` / `model` / `q` × `limit`(≤500) / `offset`。返回 `rows`（明细）+ `total` + `stats`（调用/成功率/token/缓存命中/首字/tok·s/`fallback` 换模型计数）+ `by_account` + `by_model` + `series`（按小时分桶） |
 | `POST /admin/api/monitoring/clear` | 清空实时环**与**持久台账（`data/usage.db`） |
-| `GET /admin/api/settings` | 不回明文密钥。返回 `admin_key_set` / `admin_key_masked` / `admin_key_is_default`、`gateway_key_set` / `gateway_key_masked`、`quota_refresh_interval`、`account_concurrency` |
-| `PUT /admin/api/settings` | 改密钥、刷新间隔、并发上限（改后即生效，落 meta 表；并发 0 = 不限）。前端回填的掩码（含 `…` 或 `••••`）忽略不覆盖；网关 key 传空字符串表示关闭校验 |
+| `GET /admin/api/settings` | 不回明文密钥。返回 `admin_key_set` / `admin_key_masked` / `admin_key_is_default`、`gateway_key_set` / `gateway_key_masked`、`quota_refresh_interval`、`account_concurrency`、`claim_round_interval`、`model_fallback_enabled`（bool）、`model_fallback_chain`（**归一化后**的逗号串：小写别名映射上游官方名、去重、去空，与 `GET /admin/api/models` 的 `chain` 数组永远一致。所以 PUT 之后再 GET 看到的可能不是写进去的原文，这是有意的——回填要与网关实际请求的模型名一致）、`model_fallback_ttl`（int 秒） |
+| `PUT /admin/api/settings` | 改密钥、刷新间隔、并发上限、自动领取轮间隔、模型兜底三项（改后即生效，落 meta 表；未传字段不动）。数字字段口径：`quota_refresh_interval` / `account_concurrency` / `claim_round_interval` 用 `max(0, …)` 钳制，而 `model_fallback_ttl` **故意不钳制**——负数或非数字直接 `400`「模型兜底冷却必须是非负整数」（0 有明确语义 = 不跳过已判死模型，静默改写成 0 会让人以为冷却关了其实没生效）。`model_fallback_enabled` 收真布尔或 `"1"/"0"/"true"/"false"`（兼容 `yes`/`on`），统一落库成 `"1"`/`"0"`；`model_fallback_chain` 收字符串或字符串数组，只做 split → strip → 去空 → 逗号拼接，**大小写按原样落库**（写 `glm-5.3` 就存 `glm-5.3`，由 `modelpool.chain` 在读取时归一化），**空串合法**（= 不兜底）。前端回填的掩码（含 `…` 或 `••••`）忽略不覆盖；网关 key 传空字符串表示关闭校验 |
+| `GET /admin/api/models` | 模型兜底实时台账（固定 `zai`，无 `provider` 参数）：`enabled`、`chain`（**归一化后的数组**：小写别名映射官方名、去重、去空；与 `/settings` 的 `model_fallback_chain` 是同一份链的两种形态，永远一致）、`ttl`，以及 `models[]`——每行就是 `modelpool.snapshot("zai")`：`model` / `state` ∈ `quota_ok`\|`unknown`\|`dead` / `reason`（仅 dead 有值，人读的判死原因）/ `dead_until`（epoch 秒 float，非 dead 为 `null`）/ `alive_accounts`（还有余额的账号数）/ `accounts_total`（启用账号数）/ `remaining`（该模型池内剩余合计，无额度快照为 `null`）/ `in_chain`（是否在兜底链里；不在链内但余额表出现过的模型也会列出） |
+| `POST /admin/api/models/revive` | 人工「立即恢复」：`{"model": "GLM-5.3"}` 只清该模型的死标记；`{}` 或不带 body 清空整份台账（`modelpool.clear("zai")`）。一律返回 `{"ok": true}`，模型不在链上也是 no-op（幂等） |
 
 ### 探活
 

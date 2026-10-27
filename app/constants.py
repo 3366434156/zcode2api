@@ -90,6 +90,18 @@ MODEL_NAME_MAP = {
 # 上游 3006 model not allowed；按账号实际余额窗口公布）
 AVAILABLE_MODELS = ["GLM-5.3-Flash", "GLM-5.3"]
 
+# ── 模型兜底（「这个模型全池都没了，就换下一个模型」）─────────────────────────
+# 默认顺序：先用最强的主力，再退到 Flash（额度独立计），最后是更老的型号
+# （可能不在当前套餐里 → 上游 3006，会被快速标记跳过，不会反复撞墙）。
+MODEL_FALLBACK_CHAIN = ["GLM-5.3", "GLM-5.3-Flash", "GLM-5.2", "GLM-5-Turbo", "GLM-4.7"]
+# bigmodel（智谱开放平台）模型名不同，默认不兜底，需要时用设置/环境变量显式给
+MODEL_FALLBACK_CHAIN_BIGMODEL: list[str] = []
+# 「这个模型不可用」的上游业务码：1005 额度用尽 / 3006 模型不在套餐内。
+# 注意 3009（model concurrency limit exceeded）不在此列——那是并发租约，
+# 等一两秒就恢复，换模型是错的。
+MODEL_UNAVAILABLE_CODES = (1005, 3006)
+MODEL_UNAVAILABLE_MARKERS = ("exceed quota limit", "model not allowed", "model_not_allowed")
+
 # 上游 max_tokens 合法范围（2026-09-06 实测：超限报 400 code 1210
 # 「max_tokens参数非法：限制数值范围[1,131072]」，客户端（如 auto-compact 续传）
 # 可能带更大的值，网关统一钳制）

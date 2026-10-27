@@ -1,6 +1,6 @@
 # 01 — 总体架构
 
-状态：与 2.5.11 实现对齐（无 pool.py / gateway 子包 / bundle.py / zclient.py / `/v1/responses`）。
+状态：与 2.5.11 实现对齐（无 pool.py / gateway 子包 / bundle.py / zclient.py / `/v1/responses`；模型维度另设 `app/modelpool.py`）。
 
 ## 1. 系统定位
 
@@ -49,6 +49,7 @@ zcode-hub/
 │   ├── settings.py        # 环境变量（.env）
 │   ├── models.py          # Account、Status；选号/回退/billing 门在账号对象上
 │   ├── store.py           # SQLite WAL：账号 CRUD、round-robin select、设置 KV
+│   ├── modelpool.py       # 模型兜底：模型可用性台账（额度快照 + 反应式死标记）与兜底顺序
 │   ├── routes/gateway.py  # /v1/messages + /v1/chat/completions 调度与错误分类
 │   ├── routes/admin_api.py
 │   ├── routes/pages.py
@@ -77,32 +78,45 @@ zcode-hub/
 ### 模块间依赖规则
 
 - 选号在 `store.select` + `Account.is_selectable`，没有独立 `pool.py`
+- 调度分两层：**换模型**在 `modelpool.candidates`（模型维度：这个模型全池还有没有额度），**换号**在 `store.select`（账号维度：这一轮用谁）。`routes/gateway.py::_dispatch` 先问模型、再问账号
 - `routes/gateway.py` 直接改账号状态（INVALID / DISABLED / EXHAUSTED / COOLING）并 `store.update_account`
 - `quota.py` / `claim.py` 复用 `captcha.py` 取验证码 token
 - 删号后 `update_account` 拒绝写回，避免后台任务 `INSERT OR REPLACE` 救活已删行
 
 ## 4. 核心流程
 
-### 4.1 网关请求（含账号池故障转移）
+### 4.1 网关请求（两层调度：先换模型，再换号）
 
 ```
-client → 鉴权 → [循环: attempt ≤ MAX_ACCOUNT_ATTEMPTS=5]
-   1. store.select 取号（round-robin；跳过 exhausted / 冷却中 / 手动停用；
-      JWT invalid/风控 disabled 仅当同账号有 API Key 回退时可选）
-   2. 并发槽：该号在飞 ≥ account_concurrency 则跳号（不排队；跳过不计 attempt）
-   3. 构建上游请求（每账号指纹 + 透传头过滤 + Plan/Key 通道）
-   4. 响应分类：
-      ok                 → 透传/翻译返回；释放槽在流关闭时
-      402/额度关键词      → EXHAUSTED，换号
-      429                → 不冷却，原地等 Retry-After 后重试（等待期间放槽）；
-                           Plan 预算耗尽且有 Key 则 force_fallback
-      401/403(非验证码)   → INVALID；JWT+Key 可切回退，纯 Key 不可再选
-      3012/405 风控       → ban_for_risk（DISABLED）；JWT+Key 可切回退
-      403(验证码挑战)     → 刷新验证码原账号重试（≤3 次）
-      5xx                → 重试后 COOLING，换号
-      其它 4xx           → 原样回传客户端
-   5. 池内无可选号 / 全满 → 503 no_available_account
+client → 鉴权 → [第一层 换模型：modelpool.candidates(provider, requested)]
+  models = 请求模型 + 兜底链（归一化上游大小写、去重、跳过 dead、quota_ok 排在 unknown 前）
+  （请求头带 x-zcode-no-fallback: 1 时 models = [请求模型]，本层直接跳过）
+  for model in models:
+      [第二层 换号：循环 attempt ≤ MAX_ACCOUNT_ATTEMPTS=5]
+        1. store.select 取号（round-robin；跳过 exhausted / 冷却中 / 手动停用；
+           JWT invalid/风控 disabled 仅当同账号有 API Key 回退时可选）
+        2. 并发槽：该号在飞 ≥ account_concurrency 则跳号（不排队；跳过不计 attempt）
+        3. 构建上游请求（每账号指纹 + 透传头过滤 + Plan/Key 通道）
+        4. 响应分类：
+          ok                 → 透传/翻译返回；释放槽在流关闭时；modelpool.revive(model)
+          402/额度关键词      → EXHAUSTED，换号
+          429                → 不冷却，原地等 Retry-After 后重试（等待期间放槽）；
+                               Plan 预算耗尽且有 Key 则 force_fallback
+          1005/3006          → 只换号、不动账号状态；整轮都如此 → modelpool.mark_dead，
+                               换下一个模型
+          3009               → 短等重试整轮（MODEL_BUSY_WAIT × MODEL_BUSY_ROUNDS），
+                               不换模型、不换号
+          401/403(非验证码)   → INVALID；JWT+Key 可切回退，纯 Key 不可再选
+          3012/405 风控       → ban_for_risk（DISABLED）；JWT+Key 可切回退
+          403(验证码挑战)     → 刷新验证码原账号重试（≤3 次）
+          5xx                → 重试后 COOLING，换号
+          其它 4xx           → 原样回传客户端
+        5. 池内无可选号 / 全满 → 该模型无解
+  模型试完，或遇到换模型救不了的失败 → 503 no_available_account
 ```
+
+「该模型全池不可用」的判死前提见 `05-upstream-protocols.md` §12：整轮试过的每个账号都是
+1005/3006、可轮询账号真的试完、且没有账号因本账号并发满被跳过，三条缺一不判死。
 
 ### 4.2 账号健康状态机
 
@@ -122,7 +136,7 @@ client → 鉴权 → [循环: attempt ≤ MAX_ACCOUNT_ATTEMPTS=5]
    JWT+Key：INVALID/DISABLED 仍可选，对话走 api.z.ai 回退；纯 apiKey 不可再选。
 ```
 
-参数：`MAX_ACCOUNT_ATTEMPTS=5`、`COOLING_SECONDS=300`（仅 5xx/连接失败）、`RETRY_429_TIMES=5`、`ACCOUNT_CONCURRENCY=1`（0 = 不限；上游对「账号 × 模型」并发硬限很低，超了回 429 code 3009，一账号一路最稳）。额度耗尽由后台 `quota` 刷新探测恢复，没有独立 `exhausted_retry_seconds`。
+参数：`MAX_ACCOUNT_ATTEMPTS=5`、`COOLING_SECONDS=300`（仅 5xx/连接失败）、`RETRY_429_TIMES=5`、`ACCOUNT_CONCURRENCY=1`（0 = 不限；上游对「账号 × 模型」并发硬限很低，超了回 429 code 3009，一账号一路最稳）、`MODEL_FALLBACK_TTL=600`（模型判死冷却秒数，0 = 不跳过）。额度耗尽由后台 `quota` 刷新探测恢复，没有独立 `exhausted_retry_seconds`。
 
 ### 4.3 额度监控
 

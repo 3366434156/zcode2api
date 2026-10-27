@@ -67,6 +67,34 @@ def test_model_map():
     assert constants.AVAILABLE_MODELS == ["GLM-5.3-Flash", "GLM-5.3"]
 
 
+def test_model_fallback_constants():
+    """模型兜底的默认顺序与「模型不可用」业务码（改这两项 = 改调度策略）。"""
+    # 顺序即优先级：主力 → Flash（额度独立计）→ 更老的型号
+    assert constants.MODEL_FALLBACK_CHAIN == [
+        "GLM-5.3", "GLM-5.3-Flash", "GLM-5.2", "GLM-5-Turbo", "GLM-4.7",
+    ]
+    # bigmodel（智谱开放平台）模型名不同：默认不兜底，需要时显式给
+    assert constants.MODEL_FALLBACK_CHAIN_BIGMODEL == []
+    # 1005 额度用尽 / 3006 不在套餐内 = 这个账号的这个模型不可用（→ 换模型）
+    assert constants.MODEL_UNAVAILABLE_CODES == (1005, 3006)
+    # 3009 是模型并发租约（等一两秒就好），必须**不**在此列，否则会误换模型
+    assert 3009 not in constants.MODEL_UNAVAILABLE_CODES
+    assert 3012 not in constants.MODEL_UNAVAILABLE_CODES
+    assert "exceed quota limit" in constants.MODEL_UNAVAILABLE_MARKERS
+    assert "model not allowed" in constants.MODEL_UNAVAILABLE_MARKERS
+
+
+def test_model_fallback_settings_defaults_from_constants():
+    """settings 的兜底链默认值必须来自 constants（禁止模块里再硬编码模型名）。"""
+    from app import settings
+
+    assert settings.MODEL_FALLBACK_CHAIN == constants.MODEL_FALLBACK_CHAIN
+    assert settings.MODEL_FALLBACK_CHAINS["zai"] == constants.MODEL_FALLBACK_CHAIN
+    assert settings.MODEL_FALLBACK_CHAINS["bigmodel"] == constants.MODEL_FALLBACK_CHAIN_BIGMODEL
+    assert settings.MODEL_FALLBACK_ENABLED is True
+    assert settings.MODEL_FALLBACK_TTL > 0
+
+
 def test_rejection_signals():
     assert constants.EXHAUST_HTTP_STATUSES == (402,)
     assert "余额不足" in constants.EXHAUST_KEYWORDS

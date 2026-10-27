@@ -80,6 +80,22 @@ def mark_account(req_id: str, account_name: str, mode: str, account_id: str = ""
                 entry["account_id"] = account_id
 
 
+def mark_model(req_id: str, model: str) -> None:
+    """记录实际服务的模型（模型兜底换过之后调用）。
+
+    `model` 换成兜底模型，`requested_model` 保留客户端原本点的那个——
+    台账里两者不一致就是「这次换了模型」，前端据此打标。
+    """
+    with _lock:
+        entry = _inflight.get(req_id)
+        if entry is None or not model:
+            return
+        previous = entry.get("model") or ""
+        if not entry.get("requested_model") and previous and previous != model:
+            entry["requested_model"] = previous
+        entry["model"] = model
+
+
 def mark_first(req_id: str) -> None:
     """首个内容块离开网关的时刻 → 真正的首字延迟。"""
     with _lock:

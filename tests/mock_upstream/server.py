@@ -18,6 +18,12 @@
 观测协议（响应头）：
   x-mock-call-index: <n>         该凭证第 n 次被调用
 记录：app.state.calls —— [(method, path, headers, body_bytes)]，测试直接断言。
+
+按模型判死（模型兜底用例，与 scenario 机制正交——只按 payload.model 命中，
+不影响按凭证排队的场景）：
+  app.state.dead_models           → 200 + {"code":1005,"msg":"exceed quota limit"}
+  app.state.unavailable_models    → 200 + {"code":3006,"msg":"model not allowed"}
+  app.state.unavailable_models_400 → 400 + {"code":3006,"msg":"model not allowed"}
 """
 
 from __future__ import annotations
@@ -128,6 +134,10 @@ def build_app() -> FastAPI:
     app.state.calls: list[tuple[str, str, dict, bytes]] = []
     app.state.counters: dict[str, int] = {}      # 凭证前缀 → 调用次数
     app.state.sequences: dict[str, list[str]] = {}  # bind → scenario 队列（测试侧写入）
+    # 按模型判死的三个集合（模型兜底用例，测试侧直接写；见 _model_override）
+    app.state.dead_models: set[str] = set()
+    app.state.unavailable_models: set[str] = set()
+    app.state.unavailable_models_400: set[str] = set()
 
     def _record(method: str, path: str, headers: dict, body: bytes) -> None:
         app.state.calls.append((method, path, headers, body))
@@ -177,20 +187,25 @@ def build_app() -> FastAPI:
         bind_gauge = headers.get("x-mock-bind") or _bind_key(headers)
         conc_in[bind_gauge] = conc_in.get(bind_gauge, 0) + 1
         conc_max[bind_gauge] = max(conc_max.get(bind_gauge, 0), conc_in[bind_gauge])
+        # 按模型判死：优先于 scenario（场景按凭证排队，模型判死按 payload.model 命中）
+        model_override = _model_override(payload)
         try:
             if scenario == "slow_first_byte":
                 await asyncio.sleep(30)
             if scenario == "slow":
                 await asyncio.sleep(0.3)
 
-            status, resp_body, extra_headers = _messages_result(scenario, payload)
+            if model_override is not None:
+                status, resp_body, extra_headers = model_override
+            else:
+                status, resp_body, extra_headers = _messages_result(scenario, payload)
         finally:
             left = conc_in[bind_gauge] - 1
             if left <= 0:
                 conc_in.pop(bind_gauge, None)
             else:
                 conc_in[bind_gauge] = left
-        if status != 200:
+        if status != 200 or model_override is not None:
             return Response(
                 json.dumps(resp_body), status_code=status,
                 media_type="application/json",
@@ -239,6 +254,25 @@ def build_app() -> FastAPI:
         return Response(raw, status_code=200, media_type=media,
                         headers={"x-mock-call-index": str(n)})
 
+    def _model_override(payload: dict) -> tuple[int, Any, dict] | None:
+        """按模型判死（模型兜底用例的开关）：payload.model 命中集合即回业务错误。
+
+        三种上游形态各留一个集合，方便钉住「换模型」的判定不依赖某一种承载方式：
+        - dead_models：HTTP 200 + code 1005（额度用尽，线上实测形态）
+        - unavailable_models：HTTP 200 + code 3006（模型不在套餐内）
+        - unavailable_models_400：HTTP 400 + code 3006（同一业务码的另一承载）
+        """
+        model = str(payload.get("model") or "")
+        if not model:
+            return None
+        if model in (getattr(app.state, "dead_models", None) or ()):
+            return 200, {"code": 1005, "msg": "exceed quota limit", "logid": "mock"}, {}
+        if model in (getattr(app.state, "unavailable_models", None) or ()):
+            return 200, {"code": 3006, "msg": "model not allowed"}, {}
+        if model in (getattr(app.state, "unavailable_models_400", None) or ()):
+            return 400, {"code": 3006, "msg": "model not allowed"}, {}
+        return None
+
     def _messages_result(scenario: str, payload: dict) -> tuple[int, Any, dict]:
         """返回 (status, body, extra_headers)。"""
         model = payload.get("model", "GLM-5.2")
@@ -264,6 +298,9 @@ def build_app() -> FastAPI:
             return 429, _error_body("quota exceeded for this key"), {"retry-after": "30"}
         if scenario == "auth_invalid":
             return 401, _error_body("invalid api key", type="authentication_error"), {}
+        if scenario == "forbidden":
+            # 纯 403 鉴权拒绝（不带验证码挑战头/文案）：用于「403 不换模型」用例
+            return 403, _error_body("forbidden", type="authentication_error"), {}
         if scenario == "captcha_challenge":
             return 403, _error_body("captcha verify failed"), {"x-aliyun-captcha-verify-param": "need"}
         if scenario == "captcha_3007":

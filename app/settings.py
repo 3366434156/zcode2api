@@ -172,6 +172,26 @@ ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 1)
 # 回 503（合计最多 ROUNDS × WAIT 秒，客户端完全等得起）
 MODEL_BUSY_WAIT = _float("ZCODE_MODEL_BUSY_WAIT", 1.0)
 MODEL_BUSY_ROUNDS = _int("ZCODE_MODEL_BUSY_ROUNDS", 3)
+# ── 模型兜底（自动换模型）─────────────────────────────────────────────────────
+# 请求模型在全池都不可用（每个账号都被上游判成 1005 额度用尽 / 3006 不在套餐）
+# 时，按下面顺序自动换到下一个模型，客户端无感（响应头如实回报实际模型）。
+# 运行期可在后台设置改（meta 表即时生效）。
+MODEL_FALLBACK_ENABLED = _bool("ZCODE_MODEL_FALLBACK", True)
+MODEL_FALLBACK_TTL = _int("ZCODE_MODEL_FALLBACK_TTL", 600)  # 判死后跳过该模型的秒数
+MODEL_FALLBACK_CHAIN = [
+    m.strip() for m in (
+        os.getenv("ZCODE_MODEL_FALLBACK_CHAIN")
+        or ",".join(constants.MODEL_FALLBACK_CHAIN)
+    ).split(",") if m.strip()
+]
+MODEL_FALLBACK_CHAIN_BIGMODEL = [
+    m.strip() for m in (os.getenv("ZCODE_MODEL_FALLBACK_CHAIN_BIGMODEL") or "").split(",")
+    if m.strip()
+]
+MODEL_FALLBACK_CHAINS = {
+    "zai": MODEL_FALLBACK_CHAIN,
+    "bigmodel": MODEL_FALLBACK_CHAIN_BIGMODEL,
+}
 # ── 流式保活 / 会话粘性（对齐 magpie 的 keepHeldAfter 与 affinity）────────────
 # SSE 心跳：客户端空闲超过该秒数就补一条注释帧 `: keep-alive`。模型思考阶段
 # 上游可能长时间只发 thinking 事件，没有心跳客户端只会显示「未响应」。
@@ -214,7 +234,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.6.12"
+APP_VERSION = "2.7.0"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 

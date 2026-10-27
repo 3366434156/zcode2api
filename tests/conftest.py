@@ -47,6 +47,25 @@ _USAGE_BINDING_MODULES = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _reset_model_pool():
+    """每个用例前后清空模型兜底台账（进程内单例，跨用例会互相污染）。
+
+    `app/modelpool.py` 的 `modelpool` 是模块级单例：反应式判死标记（1005/3006）
+    与「实测可用」的信任票都挂在进程内存里，不随 `fresh_app` 换 store 而重置
+    （它每次调用才 `from .store import store` 取当前 store，所以清内部状态就够）。
+
+    不清的后果是真实的：某个用例把整条兜底链判死后，后续用例请求的模型会被
+    静默换成别的模型（如 Flash 被判死 → 请求 Flash 却拿到 GLM-5.3），失败点
+    离真正的肇事用例很远。这里统一在进出各清一次，用例之间互不影响。
+    """
+    from app.modelpool import modelpool
+
+    modelpool.clear()
+    yield
+    modelpool.clear()
+
+
 @pytest.fixture(scope="session")
 def mock_server():
     """真实端口上的 Mock 上游。返回 (app, port)。

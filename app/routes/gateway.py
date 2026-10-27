@@ -19,6 +19,7 @@ from .. import affinity, constants, logs, reqlog, settings
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
+from ..modelpool import modelpool
 from ..models import Account, Status
 from ..openai_compat import (
     StreamConverter,
@@ -85,6 +86,52 @@ def _normalize_body(body: dict) -> dict:
 def _is_captcha_error(text: str) -> bool:
     low = text.lower()
     return "captcha" in low or "verify token" in low or "verify failed" in low
+
+
+def _is_model_unavailable(status_code: int, business_code: int | None, text: str) -> bool:
+    """上游是否在说「这个账号的这个模型不可用」（→ 换号，全池如此则换模型）。
+
+    1005 = 额度用尽，3006 = 模型不在套餐内。两者都不是账号故障（账号对其他模型
+    仍然可用），所以不能走 `_is_exhausted` 把整号踢出轮询；也不能回 4xx 给客户端
+    ——池子里往往还有别的模型能用。3009（并发租约）不在此列，它属于「等一下就好」。
+
+    429 / 405 一律不算：429 是频控信号（body 里带额度文案也照旧按频控重试，
+    与 `_is_exhausted` 同一原则），405 是风控——把频控当成「模型全池不可用」会
+    白白把一个好模型判死 TTL 那么久。
+    """
+    if status_code == 429 or status_code in constants.RISK_CONTROL_HTTP_STATUSES:
+        return False
+    if business_code in constants.MODEL_UNAVAILABLE_CODES:
+        return True
+    low = (text or "").lower()
+    if any(marker in low for marker in constants.MODEL_UNAVAILABLE_MARKERS):
+        return True
+    return any(f'"code":{code}' in low or f'"code": {code}' in low
+               for code in constants.MODEL_UNAVAILABLE_CODES)
+
+
+def _fallback_disabled(headers) -> bool:
+    """单请求关掉模型兜底：`x-zcode-no-fallback: 1` 或 `x-zcode-model-fallback: off`。
+
+    有些客户端（评测、回归对比）必须拿到自己点的那个模型，宁可失败也不要被换。
+    """
+    if not headers:
+        return False
+    raw = str(headers.get("x-zcode-no-fallback") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    mode = str(headers.get("x-zcode-model-fallback") or "").strip().lower()
+    return mode in ("off", "0", "false", "none", "disable", "disabled")
+
+
+def _model_headers(up: _Upstream) -> dict:
+    """如实回报实际服务的模型（换了模型时客户端能看见）。"""
+    headers: dict[str, str] = {}
+    if up.model:
+        headers["x-zcode-model"] = up.model
+    if up.fallback_from:
+        headers["x-zcode-model-requested"] = up.fallback_from
+    return headers
 
 
 def _detect_captcha_challenge(resp: httpx.Response, text: str | None = None) -> str | None:
@@ -215,7 +262,8 @@ async def messages(request: Request):
 
     try:
         result = await _dispatch(req_id, body, incoming_headers, port, provider,
-                                 affinity.key_of(body))
+                                 affinity.key_of(body),
+                                 no_fallback=_fallback_disabled(request.headers))
     except asyncio.CancelledError:
         # 客户端在调度期间断开（429 重试/验证码等待可达数分钟）——CancelError
         # 是 BaseException，不兜底会让监控条目永久滞留「进行中」
@@ -265,7 +313,8 @@ async def chat_completions(request: Request):
 
     try:
         result = await _dispatch(req_id, body, incoming_headers, port, provider,
-                                 affinity.key_of(body))
+                                 affinity.key_of(body),
+                                 no_fallback=_fallback_disabled(request.headers))
     except asyncio.CancelledError:
         reqlog.finish_error(req_id, "客户端断开", status=499,
                             outcome=reqlog.OUTCOME_CLIENT_ABORTED)
@@ -279,6 +328,7 @@ async def chat_completions(request: Request):
     if not isinstance(result, _Upstream):
         return result
 
+    # 兜底换过模型时这里是**实际服务**的模型（客户端点的是 requested_model）
     model = str(body.get("model") or "")
     if payload.get("stream"):
         try:
@@ -311,7 +361,7 @@ async def chat_completions(request: Request):
     reqlog.mark_last(req_id)
     reqlog.note_usage(req_id, **_usage_kwargs(usage))
     reqlog.finish_ok(req_id, t_first=result.t_first, status=result.resp.status_code)
-    return JSONResponse(anthropic_to_openai(data, model))
+    return JSONResponse(anthropic_to_openai(data, model), headers=_model_headers(result))
 
 
 def _usage_kwargs(usage: dict) -> dict:
@@ -369,32 +419,107 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
             await up.close()
 
     return StreamingResponse(_iter(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache"})
+                             headers={"Cache-Control": "no-cache", **_model_headers(up)})
 
 
-async def _dispatch(req_id, body, incoming_headers, port, provider, conv_key: str = ""):
-    """多账号轮询调度：_Upstream（成功）或 JSONResponse（错误）。
+async def _dispatch(req_id, body, incoming_headers, port, provider, conv_key: str = "",
+                    no_fallback: bool = False):
+    """调度：先按模型兜底链逐模型试，每个模型内部再多账号轮询。
 
-    选号顺序：会话粘性记住的账号优先（同一段对话回到同一账号，上游前缀缓存
-    才能继续命中），否则 round-robin。单账号并发限制：选号后若该账号在飞请求
-    已达上限（store.account_concurrency，0 = 不限），跳过换下一个账号——不排队
-    （流式请求可占槽位数分钟，排队会放大延迟甚至吊死客户端）。满号跳过不计入
-    MAX_ACCOUNT_ATTEMPTS（只计真正进入 _try_account 的次数）。全满/无号 → 503。
+    返回 _Upstream（成功）或 JSONResponse（错误）。
+
+    **第一层：换模型**（app/modelpool.py）。额度是按「账号 × 模型」计的，所以
+    「所有账号的这个模型都没了」是一个正常状态，而不是故障：客户端要 GLM-5.3，
+    池子里 GLM-5.3 全空但 GLM-5.3-Flash 还有额度时，直接换过去服务，客户端无感。
+    只有整轮每个账号都被上游判成「这个模型不可用」（1005 / 3006）才算该模型全池
+    不可用——并发满（3009）、限流、风控、鉴权失败都照旧只换号，绝不换模型。
+
+    **第二层：换号**（_dispatch_model）。选号顺序：会话粘性记住的账号优先（同一段
+    对话回到同一账号，上游前缀缓存才能继续命中），否则 round-robin。单账号并发
+    限制：选号后若该账号在飞请求已达上限（store.account_concurrency，0 = 不限），
+    跳过换下一个账号——不排队（流式请求可占槽位数分钟，排队会放大延迟甚至吊死
+    客户端）。满号跳过不计入 MAX_ACCOUNT_ATTEMPTS（只计真正进入 _try_account 的
+    次数）。全满/无号 → 503。
 
     模型级并发（上游 3009）：实测「上一个请求刚结束的 1–2 秒内」再发，所有账号
     都会回 3009——那是上游按模型计的并发租约还没释放，不是账号坏了。此时直接
     回 503 太浪费，整轮短等再来（合计最多 MODEL_BUSY_ROUNDS × MODEL_BUSY_WAIT）；
     只有整轮失败**全部**是 3009 才这样重试，别的原因照旧立刻收口。
     """
-    limit = _limit()
+    requested = str(body.get("model") or "")
+    models = [requested] if no_fallback else modelpool.candidates(provider, requested)
+    if not models:
+        models = [requested]
     prefer = affinity.prefer(provider, conv_key)
     # 换号原因的出口：最后一个账号为什么不可用（模型额度用尽等），503 时如实回给客户端
     reason: list[str] = [""]
+    dead_models: list[str] = []
+
+    for idx, model in enumerate(models):
+        # 必须无条件改写 body["model"]：请求模型本身被判死时 models[0] 就已经是兜底
+        # 模型了（candidates 会把 dead 的剔掉），只在 idx>0 时改写会让这一轮仍然打
+        # 原来那个模型——上游继续回 1005，兜底形同虚设（probe 里踩到过）。
+        body["model"] = model
+        if model != requested:
+            reqlog.mark_model(req_id, model)
+            # 上一轮真正判死的那个模型（链上第 2 个之后就不是 requested 了）；
+            # 请求模型自己一开始就被判死时没有"上一轮"的上游原因，用 modelpool
+            # 记住的判死理由，别只写一句"模型不可用"
+            previous = dead_models[-1] if dead_models else requested
+            why = reason[0] or modelpool.describe(provider, previous) or "模型不可用"
+            logs.warn(
+                req_id,
+                f"{previous} 全池不可用（{why}），"
+                f"自动切换到 {model}（第 {idx + 1}/{len(models)} 个模型）",
+            )
+        reason[0] = ""
+        result = await _dispatch_model(
+            req_id, body, incoming_headers, port, provider, prefer, conv_key, reason,
+        )
+        if isinstance(result, _Upstream):
+            modelpool.revive(provider, model)   # 实测可用：清死标记，记信任票
+            result.model = model
+            result.fallback_from = requested if model != requested else ""
+            return result
+        if result is _MODEL_DEAD:
+            modelpool.mark_dead(provider, model, reason[0] or "模型不可用")
+            dead_models.append(model)
+            continue
+        if result is None:
+            break       # 失败原因不是「模型不可用」：换模型救不了，收口
+        return result
+
+    detail = reason[0] or "无可用账号 / 额度均已耗尽 / 并发已满"
+    if dead_models:
+        detail = f"{'、'.join(dead_models)} 全池不可用；{detail}"
+    logs.req_err(req_id, detail)
+    reqlog.finish_error(req_id, detail, status=503)
+    message = detail or "所有账号均不可用、额度已用完或并发已满，请在后台检查账号状态"
+    return JSONResponse(
+        {"error": {"message": message, "type": "no_available_account"}},
+        status_code=503,
+    )
+
+
+async def _dispatch_model(req_id, body, incoming_headers, port, provider, prefer, conv_key,
+                          reason: list[str]):
+    """单个模型内的多账号轮询。
+
+    返回 _Upstream / JSONResponse（其它错误直接回传）/ _NEXT_MODEL 语义的
+    `_MODEL_DEAD`（整轮每个账号都是「这个模型不可用」）/ None（失败但非模型问题）。
+    """
+    limit = _limit()
 
     for round_no in range(settings.MODEL_BUSY_ROUNDS + 1):
         tried: set[str] = set()
         attempts = 0
         busy_hits = 0
+        model_hits = 0
+        skipped_busy = 0         # 因为本账号并发满而跳过的次数
+        # 「这一轮该问几个账号」的独立口径：不能靠 select 返回 None 来判断问完了
+        # ——账号数正好等于 MAX_ACCOUNT_ATTEMPTS 时，循环先被 attempts 上限截断，
+        # 永远等不到那个 None（实测 5 个账号时兜底因此完全不触发）。
+        pool_size = store.count_selectable(provider)
 
         while attempts < MAX_ACCOUNT_ATTEMPTS:
             account = store.select(provider, skip_ids=tried, prefer=prefer)
@@ -403,6 +528,7 @@ async def _dispatch(req_id, body, incoming_headers, port, provider, conv_key: st
             tried.add(account.id)
             if limit > 0 and _inflight.get(account.id, 0) >= limit:
                 logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
+                skipped_busy += 1
                 continue
             attempts += 1
             needs_captcha = provider == "zai" and account.uses_plan_channel()
@@ -423,7 +549,9 @@ async def _dispatch(req_id, body, incoming_headers, port, provider, conv_key: st
                 raise
             if result is _NEXT_BUSY:
                 busy_hits += 1
-            if result is _NEXT_ACCOUNT or result is _NEXT_BUSY:
+            elif result is _NEXT_MODEL:
+                model_hits += 1
+            if result is _NEXT_ACCOUNT or result is _NEXT_BUSY or result is _NEXT_MODEL:
                 if slot_box[0] is not None:
                     _release_slot(slot_box[0])
                     slot_box[0] = None
@@ -450,16 +578,14 @@ async def _dispatch(req_id, body, incoming_headers, port, provider, conv_key: st
             )
             await _sleep(settings.MODEL_BUSY_WAIT)
             continue
+        # 整轮每个账号都被判「这个模型不可用」→ 交给 _dispatch 换模型。
+        # 两个前提缺一不可：真的把可轮询的账号都问过了（attempts >= pool_size），
+        # 且没有账号因为本账号并发满而被跳过（skipped_busy）——那两种情况只是
+        # 「没问到」，不足以断言模型全池不可用，贸然判死会把流量赶去更弱的模型。
+        if model_hits and model_hits == attempts and attempts >= pool_size and not skipped_busy:
+            return _MODEL_DEAD
         break
-
-    detail = reason[0] or "无可用账号 / 额度均已耗尽 / 并发已满"
-    logs.req_err(req_id, detail)
-    reqlog.finish_error(req_id, detail, status=503)
-    message = reason[0] or "所有账号均不可用、额度已用完或并发已满，请在后台检查账号状态"
-    return JSONResponse(
-        {"error": {"message": message, "type": "no_available_account"}},
-        status_code=503,
-    )
+    return None
 
 
 def _release_slot(account_id: str) -> None:
@@ -501,6 +627,11 @@ _NEXT_ACCOUNT = object()
 # 换号的另一种原因：这个账号卡的只是「模型并发」（上游 3009），等一两秒就能再用。
 # 单独一个哨兵，_dispatch 才知道整轮失败是否值得短等重来。
 _NEXT_BUSY = object()
+# 换模型的原因：这个账号的**这个模型**不可用（1005 额度用尽 / 3006 不在套餐）。
+# 整轮都是它 → 这个模型全池不可用，_dispatch 换下一个模型。
+_NEXT_MODEL = object()
+# _dispatch_model 的整轮结论：该模型全池不可用（换模型）。
+_MODEL_DEAD = object()
 
 
 # fire-and-forget 后台任务强引用：事件循环对 task 只持弱引用，裸 create_task
@@ -592,11 +723,12 @@ class _Upstream:
     """
 
     __slots__ = ("resp", "cm", "client", "t_first", "account_name", "mode", "on_close",
-                 "preloaded", "_closed")
+                 "preloaded", "model", "fallback_from", "_closed")
 
     def __init__(self, resp: httpx.Response, cm, client: httpx.AsyncClient,
                  t_first: float | None = None, account_name: str = "", mode: str = "",
-                 on_close=None, preloaded: bytes | None = None) -> None:
+                 on_close=None, preloaded: bytes | None = None,
+                 model: str = "", fallback_from: str = "") -> None:
         self.resp = resp
         self.cm = cm
         self.client = client
@@ -605,6 +737,8 @@ class _Upstream:
         self.mode = mode
         self.on_close = on_close
         self.preloaded = preloaded
+        self.model = model
+        self.fallback_from = fallback_from
         self._closed = False
 
     async def read(self) -> bytes:
@@ -685,7 +819,7 @@ class _Upstream:
 
         return StreamingResponse(_body_iter(), status_code=up.resp.status_code,
                                  media_type=up.resp.headers.get("content-type", "application/json"),
-                                 headers={"Cache-Control": "no-cache"})
+                                 headers={"Cache-Control": "no-cache", **_model_headers(up)})
 
 
 async def _try_account(req_id, account, body, incoming_headers, port, needs_captcha,
@@ -778,16 +912,28 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             await cm.__aexit__(None, None, None)
             await client.aclose()
 
-            # 模型级额度用尽（上游 200 + code 1005「exceed quota limit」）/ 模型并发
-            # 已满（429 + code 3009「model concurrency limit exceeded」）：都是「这个
-            # 账号对这个模型」的局部状态，账号本身仍然可用。实测同一账号 GLM-5.3 还有
-            # 300 万、GLM-5.3-Flash 已用完——按 _is_exhausted 判成账号耗尽会把整号
-            # 踢出轮询，其他模型跟着挂；而对 3009 原地等 60s 会让客户端几分钟收不到
-            # 一个字节（2026-10-27 实测非流式请求因此吊死）。两种都只换号，不动状态。
-            if (business_code == 1005 or "exceed quota limit" in text.lower()
-                    or business_code == 3009 or "concurrency limit" in text.lower()):
-                busy = business_code == 3009 or "concurrency limit" in text.lower()
-                label = "并发已满" if busy else "额度用尽"
+            # 模型级额度用尽（上游 200 + code 1005「exceed quota limit」）/ 模型不在
+            # 套餐内（3006）/ 模型并发已满（429 + code 3009）：都是「这个账号对这个
+            # 模型」的局部状态，账号本身仍然可用。实测同一账号 GLM-5.3 还有 300 万、
+            # GLM-5.3-Flash 已用完——按 _is_exhausted 判成账号耗尽会把整号踢出轮询，
+            # 其他模型跟着挂；而对 3009 原地等 60s 会让客户端几分钟收不到一个字节
+            #（2026-10-27 实测非流式请求因此吊死）。两种都只换号，不动状态。
+            busy = business_code == 3009 or "concurrency limit" in text.lower()
+            if busy:
+                account.record_result(False, f"模型并发已满: {model_name}")
+                logs.warn(
+                    req_id,
+                    f"账号 {account.name} 的 {model_name} 并发已满"
+                    f"（上游 {business_code or status_code}），换下一个账号",
+                )
+                if reason is not None:
+                    reason[0] = (f"{model_name} 并发已满"
+                                 f"（上游 code {business_code or status_code} · 换号后仍无可用）")
+                # 并发已满 ≠ 账号不可用：交给 _dispatch 决定「短等重试整轮」还是收口
+                return _NEXT_BUSY
+
+            if _is_model_unavailable(status_code, business_code, text):
+                label = "额度用尽" if business_code == 1005 or "quota" in text.lower() else "不在套餐内"
                 account.record_result(False, f"模型{label}: {model_name}")
                 logs.warn(
                     req_id,
@@ -796,11 +942,10 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 )
                 if reason is not None:
                     reason[0] = (f"{model_name} {label}"
-                                 f"（上游 code {business_code or status_code} · 换号后仍无可用）")
-                if not busy:
-                    _spawn_bg(_safe_refresh(account))   # 额度变了，后台刷新余额
-                # 并发已满 ≠ 账号不可用：交给 _dispatch 决定「短等重试整轮」还是收口
-                return _NEXT_BUSY if busy else _NEXT_ACCOUNT
+                                 f"（上游 code {business_code or status_code}）")
+                _spawn_bg(_safe_refresh(account))   # 额度变了，后台刷新余额
+                # 整轮都是这个信号 → _dispatch 会判「该模型全池不可用」并换模型
+                return _NEXT_MODEL
 
             # 验证码挑战：三形态任一命中即清池重试（不改账号状态）
             challenge = _detect_captcha_challenge(resp, text) if needs_captcha else None

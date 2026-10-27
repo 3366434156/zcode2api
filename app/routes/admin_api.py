@@ -22,6 +22,7 @@ from ..claim import (
     report_activation_events,
 )
 from ..claim import claim as do_claim
+from ..modelpool import modelpool
 from ..models import PROVIDERS, Status
 from ..oauth import ZaiAuthFlow
 from ..quota import fetch_quota, refresh_accounts
@@ -725,6 +726,12 @@ async def get_settings():
         "quota_refresh_interval": store.quota_refresh_interval(),
         "account_concurrency": store.account_concurrency(),
         "claim_round_interval": store.claim_round_interval(),
+        # 回填「归一化后」的链：modelpool.chain 会把小写别名映射成上游官方名、
+        # 去重、去空。若原样回填用户写的 "glm-5.3"，输入框里看到的名字和网关
+        # 实际请求的 "GLM-5.3" 不一致，改完保存还以为没生效。
+        "model_fallback_enabled": store.model_fallback_enabled(),
+        "model_fallback_chain": ",".join(modelpool.chain("zai")),
+        "model_fallback_ttl": store.model_fallback_ttl(),
     }
 
 
@@ -762,6 +769,57 @@ async def update_settings(payload: dict = Body(...)):
         except (TypeError, ValueError):
             raise HTTPException(400, "自动领取轮间隔必须是非负整数（0 = 关闭）") from None
         store.set_setting("claim_round_interval", str(interval))
+    if payload.get("model_fallback_enabled") is not None:
+        # 前端勾选框给真布尔，脚本/配置文件给 "1"/"0"，两种都收（统一落成 "1"/"0"，
+        # store 侧只认这一种存储形态）。null 视为「没提这个字段」而不是「关掉」——
+        # 把 null 当 False 会让只想改兜底链的脚本顺手把功能关掉，很难查。
+        raw = payload["model_fallback_enabled"]
+        if isinstance(raw, bool):
+            enabled = raw
+        else:
+            enabled = str(raw).strip().lower() in ("1", "true", "yes", "on")
+        store.set_setting("model_fallback_enabled", "1" if enabled else "0")
+    if payload.get("model_fallback_chain") is not None:
+        raw = payload["model_fallback_chain"]
+        items = raw if isinstance(raw, (list, tuple)) else str(raw or "").split(",")
+        # 空串是合法值（= 不兜底），所以只去每项空白、不去掉「整体为空」
+        chain = ",".join(str(m).strip() for m in items if str(m).strip())
+        store.set_setting("model_fallback_chain", chain)
+    if payload.get("model_fallback_ttl") is not None:
+        try:
+            ttl = int(payload["model_fallback_ttl"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "模型兜底冷却必须是非负整数") from None
+        if ttl < 0:
+            raise HTTPException(400, "模型兜底冷却必须是非负整数")
+        store.set_setting("model_fallback_ttl", str(ttl))
+    return {"ok": True}
+
+
+# ── 模型兜底（自动换模型）────────────────────────────────────────────────────
+@router.get("/models")
+async def list_models():
+    """模型兜底实时台账：配置 + 每个模型的可用性证据。
+
+    后台的「状态表」与网关的调度必须看到同一份证据（额度快照 / 反应式死标记），
+    所以这里直接复用 modelpool.snapshot，而不是前端自己拼账号额度。
+    """
+    return {
+        "enabled": store.model_fallback_enabled(),
+        "chain": modelpool.chain("zai"),
+        "ttl": store.model_fallback_ttl(),
+        "models": modelpool.snapshot("zai"),
+    }
+
+
+@router.post("/models/revive")
+async def revive_models(payload: dict | None = Body(default=None)):
+    """人工「立即恢复」：给一个模型清死标记，不给则清空整个 provider。"""
+    model = str((payload or {}).get("model") or "").strip()
+    if model:
+        modelpool.revive("zai", model)
+    else:
+        modelpool.clear("zai")
     return {"ok": True}
 
 

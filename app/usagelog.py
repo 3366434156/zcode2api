@@ -230,6 +230,8 @@ class UsageLog:
                       SUM(COALESCE(cached_tokens, 0)) AS cached_tokens,
                       SUM(COALESCE(credit, 0))        AS credit,
                       SUM(CASE WHEN usage_missing = 1 THEN 1 ELSE 0 END) AS usage_missing,
+                      SUM(CASE WHEN requested_model <> '' AND requested_model <> model
+                               THEN 1 ELSE 0 END) AS fallback,
                       AVG(ttft_ms)  AS avg_ttft_ms,
                       AVG(gen_ms)   AS avg_gen_ms,
                       AVG(total_ms) AS avg_total_ms,
@@ -240,7 +242,7 @@ class UsageLog:
             ).fetchone()
         out = dict(row)
         for key in ("calls", "ok", "fail", "input_tokens", "output_tokens",
-                    "cached_tokens", "usage_missing"):
+                    "cached_tokens", "usage_missing", "fallback"):
             out[key] = int(out.get(key) or 0)
         out["credit"] = float(out.get("credit") or 0.0)
         done = out["ok"] + out["fail"]

@@ -100,6 +100,13 @@ select.input option{background:var(--panel);color:var(--ink)}
 
 /* Stat cards */
 .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+/* 9 张卡（多出「换模型」）：126px 的下限会把第 9 张挤到第二行只剩它一个，
+   压到 112px 才能在常见宽屏一排放下，窄屏仍按 auto-fit 自动折行。
+   代价是每张窄了约 17px，「2245.1 万」这种长数值会在 1280 宽度下折行——
+   所以字号和左右内边距一起收一点，保证数值仍是一行。 */
+.stat-grid-9{grid-template-columns:repeat(auto-fit,minmax(112px,1fr))}
+.stat-grid-9 .stat-cell{padding:14px 12px}
+.stat-grid-9 .stat-num{font-size:18px}
 /* 卡片质感：默认极轻内高光；悬停微抬 + 描边提亮 + 角落暖光。
    只动 transform/opacity/box-shadow，不触发重排，列表滚动也不掉帧。 */
 .stat-cell{position:relative;overflow:hidden;min-height:88px;padding:14px 16px;border-radius:12px;
@@ -267,6 +274,27 @@ select.input option{background:var(--panel);color:var(--ink)}
 .settings-row label{font-size:13px;font-weight:600}
 .settings-row .hint{font-size:12px;color:var(--ink-mute);line-height:1.7}
 
+/* 模型兜底卡片：状态表要放 5 列证据（模型/状态/剩余/账号/原因），
+   640px 会把原因列挤成省略号，故单独放宽。 */
+.settings-card-wide{max-width:820px}
+/* 窄屏（手机后台）宁可让表格在卡片内横向滚动，也不让它顶破卡片边框 */
+.mf-table{display:flex;flex-direction:column;border:1px solid var(--hairline-soft);border-radius:10px;background:var(--panel-2);overflow-x:auto}
+/* grid 轨道默认按 max-content 撑开：不显式写 minmax(0,1fr)，520px 的状态表
+   会把整张卡片顶出手机屏幕（表格自己也就不再滚动了） */
+.settings-card-wide .settings-row{grid-template-columns:minmax(0,1fr)}
+.mf-head,.mf-row{min-width:520px;display:grid;grid-template-columns:minmax(110px,1.1fr) 72px 92px 96px minmax(130px,1.5fr);gap:10px;align-items:center;padding:8px 12px}
+.mf-head{font-size:11px;font-weight:600;color:var(--ink-mute);letter-spacing:.04em;border-bottom:1px solid var(--hairline-soft)}
+.mf-row{font-size:12.5px;color:var(--ink-dim);border-bottom:1px solid var(--hairline-soft)}
+.mf-row:last-child{border-bottom:none}
+.mf-model{font-family:var(--mono);font-size:11.5px;font-weight:600;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mf-num{font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.mf-reason{display:flex;align-items:center;gap:6px;min-width:0;font-size:11.5px;color:var(--ink-mute)}
+.mf-reason > span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mf-out{font-size:10px;font-weight:600;color:var(--ink-mute);background:var(--panel);border:1px solid var(--hairline);border-radius:4px;padding:0 5px;margin-left:4px;vertical-align:middle;cursor:help}
+.mf-revive{flex:none;height:22px;padding:0 8px;border-radius:6px;border:1px solid var(--hairline);background:var(--panel);color:var(--ink-dim);font-size:11px;font-weight:600;cursor:pointer}
+.mf-revive:hover{color:var(--amber);border-color:rgba(232,163,61,.45)}
+.mf-empty{padding:14px 12px;font-size:12px;color:var(--ink-mute)}
+
 /* Footer */
 .site-footer{position:fixed;right:18px;bottom:10px;z-index:40;display:inline-flex;align-items:center;gap:6px;color:rgba(233,231,225,.22);font-size:11px;font-weight:500}
 .cb{width:14px;height:14px;accent-color:var(--amber);cursor:pointer}
@@ -295,9 +323,10 @@ select.input option{background:var(--panel);color:var(--ink)}
 .mon-tab-count{min-width:18px;height:18px;padding:0 5px;border-radius:999px;background:rgba(255,255,255,.14);font-size:11px;font-weight:600;display:inline-flex;align-items:center;justify-content:center}
 .mon-tab.active .mon-tab-count{background:rgba(0,0,0,.18)}
 .mon-head,.mon-row{display:grid;gap:12px;align-items:center;padding:9px 16px}
-/* 明细表：13 列（时间/账号/模型/结果/码/首字/生成/总耗时/输入/命中/输出/tok·s/内容） */
-.mon-grid-detail{grid-template-columns:100px 116px 104px 116px 38px 56px 56px 64px 64px 52px 64px 52px minmax(170px,1fr)}
-.mon-grid-live{grid-template-columns:100px 118px 108px 104px 58px 58px 66px 66px 66px 54px minmax(180px,1fr)}
+/* 明细表：13 列（时间/账号/模型/结果/码/首字/生成/总耗时/输入/命中/输出/tok·s/内容）
+   模型列 136px：要放下「GLM-5.3-Flash」+「换模型」徽标，104px 会被 ellipsis 截掉徽标 */
+.mon-grid-detail{grid-template-columns:100px 116px 136px 116px 38px 56px 56px 64px 64px 52px 64px 52px minmax(170px,1fr)}
+.mon-grid-live{grid-template-columns:100px 118px 136px 104px 58px 58px 66px 66px 66px 54px minmax(180px,1fr)}
 .mon-grid-agg{grid-template-columns:minmax(140px,1.2fr) 76px 64px 84px 84px 84px 84px 64px 130px}
 .mon-head{font-size:11px;font-weight:600;color:var(--ink-mute);letter-spacing:.04em;border-bottom:1px solid var(--hairline-soft)}
 .mon-row{border-bottom:1px solid var(--hairline-soft);font-size:12.5px;color:var(--ink-dim)}
@@ -311,6 +340,9 @@ select.input option{background:var(--panel);color:var(--ink)}
 .mon-preview{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink-mute)}
 .mon-preview .err-line{color:var(--red)}
 .mon-stream{display:inline-block;margin-left:4px;padding:0 5px;border-radius:4px;font-size:10px;background:rgba(109,168,232,.14);color:#6da8e8;font-weight:600;white-space:nowrap;vertical-align:middle;cursor:help}
+/* 换模型：客户端点的模型与实际服务的模型不同（模型兜底自动切换）。
+   用暖色而非蓝色，和「流式」这种协议形态标记区分开——它是「发生过一次切换」的事实。 */
+.mon-swap{display:inline-block;margin-left:4px;padding:0 5px;border-radius:4px;font-size:10px;background:rgba(232,163,61,.16);color:var(--amber);font-weight:600;white-space:nowrap;vertical-align:middle;cursor:help}
 .mon-muted{color:var(--ink-mute);font-weight:400}
 .tier-b.jwt{background:rgba(109,200,184,.16);color:#6dc8b8}
 

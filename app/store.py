@@ -85,6 +85,18 @@ class Store:
                 f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('claim_round_interval', ?)",
                 (str(settings.CLAIM_ROUND_INTERVAL),),
             )
+            conn.execute(
+                f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('model_fallback_enabled', ?)",
+                ("1" if settings.MODEL_FALLBACK_ENABLED else "0",),
+            )
+            conn.execute(
+                f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('model_fallback_chain', ?)",
+                (",".join(settings.MODEL_FALLBACK_CHAIN),),
+            )
+            conn.execute(
+                f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('model_fallback_ttl', ?)",
+                (str(settings.MODEL_FALLBACK_TTL),),
+            )
             conn.commit()
 
     def _load(self) -> None:
@@ -96,6 +108,11 @@ class Store:
             self._settings.setdefault("quota_refresh_interval", str(settings.QUOTA_REFRESH_INTERVAL))
             self._settings.setdefault("account_concurrency", str(settings.ACCOUNT_CONCURRENCY))
             self._settings.setdefault("claim_round_interval", str(settings.CLAIM_ROUND_INTERVAL))
+            self._settings.setdefault("model_fallback_enabled",
+                                      "1" if settings.MODEL_FALLBACK_ENABLED else "0")
+            self._settings.setdefault("model_fallback_chain",
+                                      ",".join(settings.MODEL_FALLBACK_CHAIN))
+            self._settings.setdefault("model_fallback_ttl", str(settings.MODEL_FALLBACK_TTL))
 
             self._accounts = {p: [] for p in PROVIDERS}
             rows = conn.execute(
@@ -178,6 +195,31 @@ class Store:
             return max(0, int(self.get_setting("claim_round_interval", settings.CLAIM_ROUND_INTERVAL)))
         except (TypeError, ValueError):
             return settings.CLAIM_ROUND_INTERVAL
+
+    # ── 模型兜底（自动换模型）─────────────────────────────────────────────────
+    def model_fallback_enabled(self) -> bool:
+        """请求模型全池不可用时是否自动换到下一个模型（运行时可改）。"""
+        raw = str(self.get_setting(
+            "model_fallback_enabled",
+            "1" if settings.MODEL_FALLBACK_ENABLED else "0",
+        )).strip().lower()
+        return raw in ("1", "true", "yes", "on")
+
+    def model_fallback_chain(self, provider: str = "zai") -> list[str]:
+        """兜底模型顺序（逗号分隔，运行时可改；空 = 该 provider 不兜底）。"""
+        default = settings.MODEL_FALLBACK_CHAINS.get(provider)
+        if default is None:
+            default = settings.MODEL_FALLBACK_CHAIN
+        raw = self.get_setting("model_fallback_chain", ",".join(default))
+        items = [m.strip() for m in str(raw or "").split(",")]
+        return [m for m in items if m]
+
+    def model_fallback_ttl(self) -> int:
+        """判定「这个模型全池不可用」后跳过它的秒数（0 = 不跳过，每次照试）。"""
+        try:
+            return max(0, int(self.get_setting("model_fallback_ttl", settings.MODEL_FALLBACK_TTL)))
+        except (TypeError, ValueError):
+            return settings.MODEL_FALLBACK_TTL
 
     # ── 账号读取 ─────────────────────────────────────────────────────────────
     def list_accounts(self, provider: str | None = None) -> list[Account]:
@@ -270,6 +312,20 @@ class Store:
             return True
 
     # ── 轮询选择 ─────────────────────────────────────────────────────────────
+    def count_selectable(self, provider: str, now: float | None = None) -> int:
+        """当前可被轮询选中的账号数（不推进游标）。
+
+        模型兜底要判断「是不是把全池都问过了」：`store.select` 返回 None 只能说明
+        「剩下的都被 skip_ids 挡住了」，而账号数正好等于 MAX_ACCOUNT_ATTEMPTS 时
+        循环会先被 attempts 上限截断，永远等不到那个 None。所以要有一个独立的池
+        大小口径（见 gateway._dispatch_model）。
+        """
+        with self._lock:
+            return sum(
+                1 for a in self._accounts.get(provider, [])
+                if a.is_selectable(now)
+            )
+
     def select(self, provider: str, skip_ids: set[str] | None = None,
                prefer: str | None = None) -> Account | None:
         """选择下一个可用账号：粘性命中优先，否则 round-robin。
